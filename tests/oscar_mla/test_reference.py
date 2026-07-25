@@ -67,6 +67,36 @@ def test_int2_constant_input_is_reconstructed() -> None:
     torch.testing.assert_close(restored, values, atol=1e-6, rtol=0)
 
 
+@pytest.mark.parametrize("distribution", ["narrow", "outlier"])
+def test_int2_narrow_and_outlier_inputs_are_finite(distribution: str) -> None:
+    if distribution == "narrow":
+        values = (1.0 + torch.linspace(-1e-4, 1e-4, 16, dtype=torch.float32)).repeat(
+            2, 1
+        )
+    else:
+        values = torch.randn(2, 16, generator=torch.Generator().manual_seed(37))
+        values[0, 0] = 1000.0
+        values[1, 8] = -1000.0
+
+    quantized = quantize_int2(values, group_size=8, clip_ratio=0.92)
+    packed = pack_int2(quantized.data)
+    unpacked = unpack_int2(packed, original_dim=values.shape[-1])
+    restored = dequantize_int2(
+        unpacked,
+        quantized.scale,
+        quantized.zero_point,
+        group_size=8,
+        dtype=values.dtype,
+    )
+
+    assert torch.isfinite(quantized.scale).all()
+    assert torch.isfinite(quantized.zero_point).all()
+    assert torch.isfinite(restored).all()
+    torch.testing.assert_close(unpacked, quantized.data, atol=0, rtol=0)
+    error = (restored - quantized.clipped).abs().reshape(2, 2, 8)
+    assert torch.all(error <= quantized.scale / 2 + 1e-6)
+
+
 @pytest.mark.parametrize(
     ("seq_len", "expected"),
     [
