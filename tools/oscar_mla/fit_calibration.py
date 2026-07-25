@@ -4,6 +4,8 @@
 import argparse
 import json
 import os
+import threading
+import time
 from pathlib import Path
 
 from vllm.model_executor.layers.quantization.oscar_mla.artifact import (
@@ -35,6 +37,32 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
 
+    started = time.monotonic()
+    stop_heartbeat = threading.Event()
+
+    def heartbeat() -> None:
+        while not stop_heartbeat.wait(600):
+            print(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "elapsed_seconds": time.monotonic() - started,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+    heartbeat_thread.start()
+    try:
+        _fit(args)
+    finally:
+        stop_heartbeat.set()
+        heartbeat_thread.join()
+
+
+def _fit(args: argparse.Namespace) -> None:
     config = json.loads(args.config.read_text(encoding="utf-8"))
     num_layers = int(config["num_layers"])
     layer_template = config["layer_name_template"]
