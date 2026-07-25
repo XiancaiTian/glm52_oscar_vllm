@@ -24,7 +24,6 @@ query = torch.randn(1, 1, latent_rank, dtype=torch.bfloat16)
 rope_values = torch.randn(sequence_length, 64, dtype=torch.bfloat16)
 query_rope = torch.randn(1, 1, 64, dtype=torch.bfloat16)
 rope_cache = torch.zeros(1, 16, 64, dtype=torch.bfloat16)
-rope_cache[0, :sequence_length].copy_(rope_values)
 rope_block_table = torch.zeros(1, 1, dtype=torch.int32)
 rotation = torch.eye(latent_rank, dtype=torch.bfloat16)
 prefix = torch.zeros(1, 2, latent_rank, dtype=torch.bfloat16)
@@ -40,9 +39,15 @@ store.oscar_mla_store_bf16(
     torch.full_like(positions, sequence_length),
     torch.zeros_like(positions),
 )
+store.oscar_mla_store_rope(
+    rope_values,
+    rope_cache,
+    torch.arange(sequence_length, dtype=torch.int32),
+)
 torch.testing.assert_close(prefix[0], latent[:2])
 torch.testing.assert_close(recent[0, 0], latent[4])
 torch.testing.assert_close(recent[0, 1], latent[3])
+torch.testing.assert_close(rope_cache[0, :sequence_length], rope_values)
 
 history_data = torch.zeros(
     1,

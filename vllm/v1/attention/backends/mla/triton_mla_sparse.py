@@ -10,6 +10,7 @@ import torch
 
 from vllm.config import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -30,12 +31,24 @@ from vllm.v1.attention.ops.mqa_logits_triton import (
     warmup_fp8_mqa_logits_triton,
     warmup_fp8_paged_mqa_logits_triton,
 )
+from vllm.v1.attention.ops.triton_oscar_mla_decode import (
+    oscar_mla_sparse_prefill,
+)
+from vllm.v1.attention.ops.triton_oscar_mla_store import (
+    oscar_mla_demote_recent,
+    oscar_mla_rotate_quantize_store,
+    oscar_mla_store_bf16,
+    oscar_mla_store_rope,
+)
 from vllm.v1.attention.ops.triton_sparse_mla_kernel import (
     _BLOCK_DV,
     _DIM_QK,
     KV_SPLITS_CANDIDATES,
     triton_sparse_mla_attention,
 )
+from vllm.v1.worker.oscar_mla_cache import OscarMLACacheTensors
+
+logger = init_logger(__name__)
 
 # DeepSeek-V3.2 / GLM-5.1 indexer shape, the only model family this backend
 # serves. Used only for autotune priming — if a future model differs, the
@@ -95,12 +108,129 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self.oscar_write_calls = 0
+        self.oscar_demotion_calls = 0
+        self.oscar_read_calls = 0
         # Cached device SM count; passed into the kernel dispatch each forward
         # so the hot path doesn't re-query `q.device.index` → dict lookup.
         self._sm_count: int | None = None
         if self.topk_indices_buffer is not None:
             self._sm_count = num_compute_units(self.topk_indices_buffer.device.index)
         self._warmup_autotune()
+
+    @staticmethod
+    def _oscar_query_positions(
+        attn_metadata: XPUMLASparseMetadata,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        token_rows = torch.arange(
+            num_tokens,
+            dtype=torch.int32,
+            device=attn_metadata.seq_lens.device,
+        )
+        requests = attn_metadata.req_id_per_token[:num_tokens].long()
+        query_ends = attn_metadata.query_start_loc[requests + 1]
+        return attn_metadata.seq_lens[requests] - (query_ends - token_rows)
+
+    def do_oscar_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: OscarMLACacheTensors,
+        attn_metadata: XPUMLASparseMetadata,
+        rotation: torch.Tensor,
+        *,
+        clip_ratio: float,
+    ) -> None:
+        """Apply demotion before writing this batch's final three-pool partition."""
+        oscar = attn_metadata.oscar_mla
+        if oscar is None:
+            raise RuntimeError("oscar_mla_int2 attention metadata is missing")
+        if not isinstance(kv_cache, OscarMLACacheTensors):
+            raise TypeError("oscar_mla_int2 requires OSCAR MLA cache views")
+        num_tokens = attn_metadata.num_actual_tokens
+        latent = kv_c_normed[:num_tokens]
+        rope_values = k_pe[:num_tokens]
+        request_indices = attn_metadata.req_id_per_token[:num_tokens].long()
+        query_positions = self._oscar_query_positions(attn_metadata, num_tokens)
+        final_seq_lens = attn_metadata.seq_lens[request_indices]
+        token_hp_rows = oscar.hp_rows[request_indices]
+
+        oscar_mla_store_rope(
+            rope_values,
+            kv_cache.rope,
+            attn_metadata.slot_mapping[:num_tokens],
+        )
+
+        if oscar.demotion_positions.numel():
+            if self.oscar_demotion_calls == 0:
+                logger.info_once(
+                    "OSCAR MLA recent-to-INT2 demotion active; first batch=%d tokens",
+                    oscar.demotion_positions.numel(),
+                )
+            demotion_hp_rows = oscar.hp_rows[
+                oscar.demotion_request_indices.long()
+            ]
+            oscar_mla_demote_recent(
+                kv_cache.recent,
+                rotation,
+                kv_cache.history_data,
+                kv_cache.history_scale,
+                kv_cache.history_zero,
+                oscar.demotion_positions,
+                demotion_hp_rows,
+                oscar.demotion_page_ids,
+                oscar.demotion_page_offsets,
+                prefix_tokens=kv_cache.prefix.shape[1],
+                clip_ratio=clip_ratio,
+            )
+            self.oscar_demotion_calls += 1
+
+        history_end = torch.maximum(
+            torch.full_like(final_seq_lens, kv_cache.prefix.shape[1]),
+            final_seq_lens - kv_cache.recent.shape[1],
+        )
+        current_history = (
+            (query_positions >= kv_cache.prefix.shape[1])
+            & (query_positions < history_end)
+        )
+        history_positions = query_positions[current_history]
+        history_requests = request_indices[current_history]
+        history_indices = history_positions - kv_cache.prefix.shape[1]
+        logical_pages = torch.div(
+            history_indices,
+            kv_cache.history_data.shape[1],
+            rounding_mode="floor",
+        )
+        page_offsets = history_indices % kv_cache.history_data.shape[1]
+        page_ids = oscar.history_page_table[
+            history_requests,
+            logical_pages.long(),
+        ]
+        oscar_mla_rotate_quantize_store(
+            latent[current_history],
+            rotation,
+            kv_cache.history_data,
+            kv_cache.history_scale,
+            kv_cache.history_zero,
+            page_ids,
+            page_offsets,
+            clip_ratio=clip_ratio,
+        )
+
+        oscar_mla_store_bf16(
+            latent,
+            kv_cache.prefix,
+            kv_cache.recent,
+            query_positions,
+            final_seq_lens,
+            token_hp_rows,
+        )
+        if self.oscar_write_calls == 0:
+            logger.info_once(
+                "OSCAR MLA three-pool write active; no full BF16 latent history"
+            )
+        self.oscar_write_calls += 1
 
     def _warmup_autotune(self) -> None:
         """Prime `@triton.autotune` caches at init so the first user request
@@ -384,6 +514,53 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         attn_metadata: XPUMLASparseMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.kv_cache_dtype == "oscar_mla_int2":
+            if not isinstance(q, tuple):
+                raise TypeError(
+                    "oscar_mla_int2 requires separate latent and RoPE query"
+                )
+            if not isinstance(kv_c_and_k_pe_cache, OscarMLACacheTensors):
+                raise TypeError("oscar_mla_int2 requires OSCAR MLA cache views")
+            oscar = attn_metadata.oscar_mla
+            if oscar is None:
+                raise RuntimeError("oscar_mla_int2 attention metadata is missing")
+            q_nope, q_pe = q
+            num_actual_toks = q_nope.shape[0]
+            assert self.topk_indices_buffer is not None
+            query_positions = self._oscar_query_positions(
+                attn_metadata,
+                num_actual_toks,
+            )
+            output, lse = oscar_mla_sparse_prefill(
+                q_nope,
+                q_pe,
+                self.topk_indices_buffer[:num_actual_toks],
+                attn_metadata.req_id_per_token[:num_actual_toks],
+                query_positions,
+                kv_c_and_k_pe_cache.prefix,
+                kv_c_and_k_pe_cache.recent,
+                kv_c_and_k_pe_cache.rope,
+                attn_metadata.block_table,
+                kv_c_and_k_pe_cache.history_data,
+                kv_c_and_k_pe_cache.history_scale,
+                kv_c_and_k_pe_cache.history_zero,
+                oscar.history_page_table,
+                oscar.hp_rows,
+                attn_metadata.seq_lens,
+                layer._oscar_rotation,
+                attention_scale=self.softmax_scale,
+            )
+            if self.oscar_read_calls == 0:
+                logger.info_once(
+                    "OSCAR MLA DSA-selected mixed prefix/recent/INT2 read active"
+                )
+            self.oscar_read_calls += 1
+            output = output.to(q_nope.dtype)
+            return (
+                (output, lse)
+                if self.need_to_return_lse_for_decode
+                else (output, None)
+            )
         if is_quantized_kv_cache(self.kv_cache_dtype):
             raise NotImplementedError("FP8 kv is not supported with MLA Sparse yet")
 

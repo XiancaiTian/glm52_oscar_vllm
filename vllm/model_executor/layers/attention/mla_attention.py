@@ -574,14 +574,24 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             assert isinstance(slot_mapping, dict), (
                 f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
             )
-            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-                kv_c_normed,
-                k_pe,
-                self_kv_cache,
-                slot_mapping.get(self.layer_name),
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+            if self.kv_cache_dtype == "oscar_mla_int2":
+                self.impl.do_oscar_kv_cache_update(  # type: ignore[attr-defined]
+                    kv_c_normed,
+                    k_pe,
+                    self_kv_cache,
+                    attn_metadata,
+                    self._oscar_rotation,
+                    clip_ratio=self._oscar_clip_ratio,
+                )
+            else:
+                self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                    kv_c_normed,
+                    k_pe,
+                    self_kv_cache,
+                    slot_mapping.get(self.layer_name),
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             self.forward_impl(
                 q,
@@ -1099,7 +1109,23 @@ def unified_mla_kv_cache_update(
         f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
     )
     layer_slot_mapping = slot_mapping.get(layer_name)
-    if layer_slot_mapping is not None:
+    if kv_cache_dtype == "oscar_mla_int2":
+        attn_metadata_raw = forward_context.attn_metadata
+        if isinstance(attn_metadata_raw, dict):
+            attn_metadata = attn_metadata_raw[layer_name]
+        elif isinstance(attn_metadata_raw, list):
+            attn_metadata = attn_metadata_raw[0][layer_name]
+        else:
+            attn_metadata = attn_metadata_raw
+        attn_layer.impl.do_oscar_kv_cache_update(
+            kv_c_normed,
+            k_pe,
+            kv_cache,
+            attn_metadata,
+            attn_layer._oscar_rotation,
+            clip_ratio=attn_layer._oscar_clip_ratio,
+        )
+    elif layer_slot_mapping is not None:
         attn_layer.impl.do_kv_cache_update(
             kv_c_normed,
             k_pe,

@@ -14,6 +14,7 @@ from vllm.v1.attention.ops.triton_oscar_mla_store import (
     oscar_mla_dequantize_history,
     oscar_mla_rotate_quantize_store,
     oscar_mla_store_bf16,
+    oscar_mla_store_rope,
 )
 
 RUN_CUDA_TESTS = os.environ.get("VLLM_OSCAR_RUN_CUDA_TESTS") == "1"
@@ -202,6 +203,30 @@ def test_bf16_store_uses_final_partition_and_ring_addresses() -> None:
     torch.testing.assert_close(recent[0, 255], latent[4].bfloat16())
     torch.testing.assert_close(recent[0, 0], latent[5].bfloat16())
     torch.testing.assert_close(recent[0, 1], latent[6].bfloat16())
+
+
+@requires_cuda
+def test_rope_store_uses_standard_slot_mapping() -> None:
+    device = torch.device("cuda")
+    values = torch.arange(
+        4 * 64,
+        dtype=torch.float32,
+        device=device,
+    ).view(4, 1, 64)
+    cache = torch.full(
+        (3, 16, 64),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    slots = torch.tensor([0, 17, -1, 35], dtype=torch.int32, device=device)
+
+    oscar_mla_store_rope(values, cache, slots)
+
+    torch.testing.assert_close(cache[0, 0], values[0, 0].bfloat16())
+    torch.testing.assert_close(cache[1, 1], values[1, 0].bfloat16())
+    torch.testing.assert_close(cache[2, 3], values[3, 0].bfloat16())
+    assert torch.isnan(cache[0, 1]).all()
 
 
 @requires_cuda

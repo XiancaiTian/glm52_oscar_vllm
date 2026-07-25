@@ -224,6 +224,46 @@ def _store_bf16_latent_kernel(
 
 
 @triton.jit
+def _store_rope_kernel(
+    rope_values_ptr,
+    rope_cache_ptr,
+    slot_mapping_ptr,
+    num_rows,
+    stride_values_row: tl.constexpr,
+    stride_values_dim: tl.constexpr,
+    stride_cache_block: tl.constexpr,
+    stride_cache_token: tl.constexpr,
+    stride_cache_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    rope_head_size: tl.constexpr,
+    block_d: tl.constexpr,
+):
+    """Store original-precision RoPE rows through the standard block slots."""
+    row = tl.program_id(0)
+    if row >= num_rows:
+        return
+    slot = tl.load(slot_mapping_ptr + row)
+    if slot < 0:
+        return
+    block = slot // block_size
+    token_offset = slot % block_size
+    dims = tl.arange(0, block_d)
+    mask = dims < rope_head_size
+    values = tl.load(
+        rope_values_ptr + row * stride_values_row + dims * stride_values_dim,
+        mask=mask,
+    ).to(tl.bfloat16)
+    tl.store(
+        rope_cache_ptr
+        + block * stride_cache_block
+        + token_offset * stride_cache_token
+        + dims * stride_cache_dim,
+        values,
+        mask=mask,
+    )
+
+
+@triton.jit
 def _gather_recent_latent_kernel(
     recent_ptr,
     output_ptr,
@@ -642,6 +682,64 @@ def oscar_mla_store_bf16(
         latent_rank=latent_rank,
         block_d=block_d,
         num_warps=4,
+        num_stages=1,
+    )
+
+
+def oscar_mla_store_rope(
+    rope_values: torch.Tensor,
+    rope_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Store BF16 RoPE keys using the standard vLLM physical slot mapping."""
+    if rope_values.ndim == 3:
+        if rope_values.shape[1] != 1:
+            raise ValueError("OSCAR MLA RoPE values must have one KV head")
+        rope_values = rope_values[:, 0, :]
+    _require_cuda_tensor(
+        rope_values,
+        name="rope_values",
+        ndim=2,
+        dtype=(torch.bfloat16, torch.float16, torch.float32),
+    )
+    _require_cuda_tensor(
+        rope_cache,
+        name="rope_cache",
+        ndim=3,
+        dtype=torch.bfloat16,
+    )
+    _require_cuda_tensor(
+        slot_mapping,
+        name="slot_mapping",
+        ndim=1,
+        dtype=(torch.int32, torch.int64),
+    )
+    num_rows, rope_head_size = rope_values.shape
+    if slot_mapping.shape[0] != num_rows:
+        raise ValueError("slot_mapping length must equal the number of RoPE rows")
+    if rope_cache.shape[2] != rope_head_size:
+        raise ValueError("RoPE cache head size does not match input")
+    if rope_cache.shape[0] <= 0 or rope_cache.shape[1] <= 0:
+        raise ValueError("RoPE cache must contain at least one non-empty block")
+    if not (rope_values.device == rope_cache.device == slot_mapping.device):
+        raise ValueError("all OSCAR MLA RoPE tensors must share one CUDA device")
+    if num_rows == 0:
+        return
+
+    _store_rope_kernel[(num_rows,)](
+        rope_values,
+        rope_cache,
+        slot_mapping,
+        num_rows,
+        stride_values_row=rope_values.stride(0),
+        stride_values_dim=rope_values.stride(1),
+        stride_cache_block=rope_cache.stride(0),
+        stride_cache_token=rope_cache.stride(1),
+        stride_cache_dim=rope_cache.stride(2),
+        block_size=rope_cache.shape[1],
+        rope_head_size=rope_head_size,
+        block_d=triton.next_power_of_2(rope_head_size),
+        num_warps=1,
         num_stages=1,
     )
 
