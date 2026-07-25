@@ -179,11 +179,24 @@ def mixed_latent_attention(
     recent_latent: torch.Tensor,
     history_rotated: torch.Tensor,
     rotation: torch.Tensor,
+    query_rope: torch.Tensor | None = None,
+    prefix_rope: torch.Tensor | None = None,
+    history_rope: torch.Tensor | None = None,
+    recent_rope: torch.Tensor | None = None,
     scale: float | None = None,
 ) -> torch.Tensor:
     """Compute one softmax across BF16 tiers and rotated history."""
     query_rotated = query @ rotation
-    factor = _attention_scale(query, scale)
+    rope_tensors = (prefix_rope, history_rope, recent_rope)
+    if query_rope is None:
+        if any(tensor is not None for tensor in rope_tensors):
+            raise ValueError("query_rope is required when cached RoPE values are given")
+        rope_rank = 0
+    else:
+        if any(tensor is None for tensor in rope_tensors):
+            raise ValueError("all cached RoPE tiers are required with query_rope")
+        rope_rank = query_rope.shape[-1]
+    factor = (query.shape[-1] + rope_rank) ** -0.5 if scale is None else scale
     prefix_logits = torch.einsum("...hd,sd->...hs", query, prefix_latent)
     history_logits = torch.einsum(
         "...hd,sd->...hs",
@@ -191,6 +204,13 @@ def mixed_latent_attention(
         history_rotated,
     )
     recent_logits = torch.einsum("...hd,sd->...hs", query, recent_latent)
+    if query_rope is not None:
+        assert prefix_rope is not None
+        assert history_rope is not None
+        assert recent_rope is not None
+        prefix_logits += torch.einsum("...hd,sd->...hs", query_rope, prefix_rope)
+        history_logits += torch.einsum("...hd,sd->...hs", query_rope, history_rope)
+        recent_logits += torch.einsum("...hd,sd->...hs", query_rope, recent_rope)
     logits = torch.cat((prefix_logits, history_logits, recent_logits), dim=-1)
     weights = torch.softmax(logits * factor, dim=-1)
 

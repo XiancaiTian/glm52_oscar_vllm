@@ -58,6 +58,27 @@ def _rotation(dim: int, *, device: torch.device) -> torch.Tensor:
     return q.to(torch.bfloat16)
 
 
+def _pack_rope_cache(
+    values: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_blocks = (values.shape[0] + block_size - 1) // block_size
+    cache = torch.zeros(
+        num_blocks,
+        block_size,
+        values.shape[1],
+        dtype=torch.bfloat16,
+        device=values.device,
+    )
+    cache.view(-1, values.shape[1])[: values.shape[0]].copy_(values)
+    block_table = torch.arange(
+        num_blocks,
+        dtype=torch.int32,
+        device=values.device,
+    ).unsqueeze(0)
+    return cache, block_table
+
+
 @requires_cuda
 @pytest.mark.parametrize("seq_len", [63, 64, 319, 320, 321])
 @pytest.mark.parametrize("num_heads", [1, 4])
@@ -87,6 +108,22 @@ def test_sparse_decode_matches_three_pool_oracle(
         device=device,
         dtype=torch.bfloat16,
     )
+    rope_values = torch.randn(
+        seq_len,
+        64,
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    query_rope = torch.randn(
+        1,
+        num_heads,
+        64,
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    rope_cache, rope_block_table = _pack_rope_cache(rope_values, block_size)
     rotation = _rotation(dim, device=device)
     prefix = torch.zeros(
         1,
@@ -177,9 +214,12 @@ def test_sparse_decode_matches_three_pool_oracle(
     seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
     output, lse = oscar_mla_sparse_decode(
         query,
+        query_rope,
         selected,
         prefix,
         recent,
+        rope_cache,
+        rope_block_table,
         data,
         scale,
         zero,
@@ -198,6 +238,10 @@ def test_sparse_decode_matches_three_pool_oracle(
         recent_latent=latent[recent_start:].float(),
         history_rotated=history_rotated,
         rotation=rotation.float(),
+        query_rope=query_rope.float(),
+        prefix_rope=rope_values[:prefix_end].float(),
+        history_rope=rope_values[prefix_end:recent_start].float(),
+        recent_rope=rope_values[recent_start:].float(),
     )
     torch.testing.assert_close(output, expected, atol=0.5, rtol=0.03)
     assert torch.isfinite(output).all()
@@ -225,6 +269,22 @@ def test_sparse_decode_respects_selected_token_ids() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
+    rope_values = torch.randn(
+        seq_len,
+        64,
+        generator=generator,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    query_rope = torch.randn(
+        1,
+        1,
+        64,
+        generator=generator,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    rope_cache, rope_block_table = _pack_rope_cache(rope_values, 16)
     rotation = _rotation(dim, device=device)
     prefix = torch.zeros(1, 64, dim, dtype=torch.bfloat16, device=device)
     recent = torch.zeros(1, 256, dim, dtype=torch.bfloat16, device=device)
@@ -261,9 +321,12 @@ def test_sparse_decode_respects_selected_token_ids() -> None:
 
     output, _ = oscar_mla_sparse_decode(
         query,
+        query_rope,
         selected,
         prefix,
         recent,
+        rope_cache,
+        rope_block_table,
         data,
         scale,
         zero,
@@ -280,6 +343,10 @@ def test_sparse_decode_respects_selected_token_ids() -> None:
         recent_latent=latent[320:321].float(),
         history_rotated=history_rotated,
         rotation=rotation.float(),
+        query_rope=query_rope.float(),
+        prefix_rope=rope_values[0:1].float(),
+        history_rope=rope_values[64:65].float(),
+        recent_rope=rope_values[320:321].float(),
     )
     torch.testing.assert_close(output, expected, atol=0.5, rtol=0.03)
 
@@ -309,6 +376,22 @@ def test_sparse_prefill_is_causal_and_matches_three_pool_oracle(
         dtype=torch.bfloat16,
         device=device,
     )
+    rope_values = torch.randn(
+        seq_len,
+        64,
+        generator=generator,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    query_rope = torch.randn(
+        num_queries,
+        1,
+        64,
+        generator=generator,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    rope_cache, rope_block_table = _pack_rope_cache(rope_values, block_size)
     rotation = _rotation(dim, device=device)
     prefix = torch.zeros(1, 64, dim, dtype=torch.bfloat16, device=device)
     recent = torch.zeros(1, 256, dim, dtype=torch.bfloat16, device=device)
@@ -373,11 +456,14 @@ def test_sparse_prefill_is_causal_and_matches_three_pool_oracle(
     selected = positions.unsqueeze(0).expand(num_queries, -1)
     output, lse = oscar_mla_sparse_prefill(
         query,
+        query_rope,
         selected,
         torch.zeros(num_queries, dtype=torch.int32, device=device),
         query_positions,
         prefix,
         recent,
+        rope_cache,
+        rope_block_table,
         history_data,
         history_scale,
         history_zero,
@@ -400,6 +486,12 @@ def test_sparse_prefill_is_causal_and_matches_three_pool_oracle(
                     history_rotated if causal_length > 64 else history_rotated[:0]
                 ),
                 rotation=rotation.float(),
+                query_rope=query_rope[row : row + 1].float(),
+                prefix_rope=rope_values[: min(64, causal_length)].float(),
+                history_rope=(
+                    rope_values[64:65] if causal_length > 64 else rope_values[:0]
+                ).float(),
+                recent_rope=rope_values[65:causal_length].float(),
             )
         )
     expected = torch.cat(expected_rows, dim=0)

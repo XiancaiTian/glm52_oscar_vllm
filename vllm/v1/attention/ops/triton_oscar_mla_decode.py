@@ -20,11 +20,14 @@ from vllm.v1.attention.ops.triton_oscar_mla_store import (
 def _mixed_sparse_decode_stage1(
     query_ptr,
     query_rotated_ptr,
+    query_rope_ptr,
     selected_tokens_ptr,
     query_request_indices_ptr,
     query_positions_ptr,
     prefix_ptr,
     recent_ptr,
+    rope_ptr,
+    rope_block_table_ptr,
     history_data_ptr,
     history_scale_ptr,
     history_zero_ptr,
@@ -40,6 +43,9 @@ def _mixed_sparse_decode_stage1(
     stride_query_rotated_b: tl.constexpr,
     stride_query_rotated_h: tl.constexpr,
     stride_query_rotated_d: tl.constexpr,
+    stride_query_rope_b: tl.constexpr,
+    stride_query_rope_h: tl.constexpr,
+    stride_query_rope_d: tl.constexpr,
     stride_selected_b: tl.constexpr,
     stride_selected_k: tl.constexpr,
     stride_query_request: tl.constexpr,
@@ -50,6 +56,11 @@ def _mixed_sparse_decode_stage1(
     stride_recent_row: tl.constexpr,
     stride_recent_token: tl.constexpr,
     stride_recent_d: tl.constexpr,
+    stride_rope_block: tl.constexpr,
+    stride_rope_token: tl.constexpr,
+    stride_rope_d: tl.constexpr,
+    stride_rope_block_table_b: tl.constexpr,
+    stride_rope_block_table_page: tl.constexpr,
     stride_data_page: tl.constexpr,
     stride_data_token: tl.constexpr,
     stride_data_byte: tl.constexpr,
@@ -74,6 +85,8 @@ def _mixed_sparse_decode_stage1(
     topk: tl.constexpr,
     prefix_tokens: tl.constexpr,
     recent_tokens: tl.constexpr,
+    rope_block_size: tl.constexpr,
+    rope_head_size: tl.constexpr,
     history_block_size: tl.constexpr,
     latent_rank: tl.constexpr,
     group_size: tl.constexpr,
@@ -82,6 +95,7 @@ def _mixed_sparse_decode_stage1(
     num_requests: tl.constexpr,
     block_t: tl.constexpr,
     block_d: tl.constexpr,
+    block_r: tl.constexpr,
 ):
     query_row = tl.program_id(0)
     head = tl.program_id(1)
@@ -109,6 +123,16 @@ def _mixed_sparse_decode_stage1(
         + head * stride_query_rotated_h
         + dims * stride_query_rotated_d,
         mask=dim_mask,
+        other=0.0,
+    ).to(tl.float32)
+    rope_dims = tl.arange(0, block_r)
+    rope_dim_mask = rope_dims < rope_head_size
+    query_rope = tl.load(
+        query_rope_ptr
+        + query_row * stride_query_rope_b
+        + head * stride_query_rope_h
+        + rope_dims * stride_query_rope_d,
+        mask=rope_dim_mask,
         other=0.0,
     ).to(tl.float32)
     hp_row = tl.load(hp_rows_ptr + safe_request * stride_hp_rows)
@@ -206,6 +230,28 @@ def _mixed_sparse_decode_stage1(
         ).to(tl.float32)
         history_values = (quantized - zero) * scale
 
+        rope_logical_pages = tokens // rope_block_size
+        rope_page_offsets = tokens % rope_block_size
+        rope_physical_pages = tl.load(
+            rope_block_table_ptr
+            + safe_request * stride_rope_block_table_b
+            + rope_logical_pages * stride_rope_block_table_page,
+            mask=valid,
+            other=0,
+        )
+        rope_values = tl.load(
+            rope_ptr
+            + rope_physical_pages[:, None] * stride_rope_block
+            + rope_page_offsets[:, None] * stride_rope_token
+            + rope_dims[None, :] * stride_rope_d,
+            mask=valid[:, None] & rope_dim_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        rope_scores = tl.sum(
+            rope_values * query_rope[None, :],
+            axis=1,
+        )
+
         bf16_scores = tl.sum(
             bf16_values * query[None, :],
             axis=1,
@@ -220,8 +266,9 @@ def _mixed_sparse_decode_stage1(
                 history_scores,
                 bf16_scores,
             )
-            * attention_scale
+            + rope_scores
         )
+        scores *= attention_scale
         scores = tl.where(valid, scores, -float("inf"))
         if tl.sum(valid.to(tl.int32), axis=0) > 0:
             m_new = tl.maximum(tl.max(scores, axis=0), m_prev)
@@ -391,11 +438,14 @@ def _add_outputs_kernel(
 
 def _validate_attention_inputs(
     query: torch.Tensor,
+    query_rope: torch.Tensor,
     selected_tokens: torch.Tensor,
     query_request_indices: torch.Tensor,
     query_positions: torch.Tensor,
     prefix: torch.Tensor,
     recent: torch.Tensor,
+    rope: torch.Tensor,
+    rope_block_table: torch.Tensor,
     history_data: torch.Tensor,
     history_scale: torch.Tensor,
     history_zero: torch.Tensor,
@@ -413,6 +463,16 @@ def _validate_attention_inputs(
     num_queries, num_heads, latent_rank = query.shape
     if num_queries <= 0 or num_heads <= 0 or latent_rank <= 0:
         raise ValueError("query dimensions must all be positive")
+    _require_cuda_tensor(
+        query_rope,
+        name="query_rope",
+        ndim=3,
+        dtype=(torch.bfloat16, torch.float16, torch.float32),
+    )
+    if query_rope.shape[:2] != (num_queries, num_heads):
+        raise ValueError("query_rope batch and head dimensions must match query")
+    if query_rope.shape[2] <= 0:
+        raise ValueError("query_rope head size must be positive")
     _require_cuda_tensor(
         selected_tokens,
         name="selected_tokens",
@@ -446,6 +506,16 @@ def _validate_attention_inputs(
         raise ValueError("prefix/recent row capacities must match")
     if prefix.shape[1] <= 0 or recent.shape[1] <= 0:
         raise ValueError("prefix/recent windows must be positive")
+    _require_cuda_tensor(
+        rope,
+        name="rope",
+        ndim=3,
+        dtype=torch.bfloat16,
+    )
+    if rope.shape[0] <= 0 or rope.shape[1] <= 0:
+        raise ValueError("RoPE cache must contain at least one non-empty block")
+    if rope.shape[2] != query_rope.shape[2]:
+        raise ValueError("RoPE cache head size must match query_rope")
     num_groups, group_size, _, history_rank = _validate_history_tensors(
         history_data,
         history_scale,
@@ -462,6 +532,14 @@ def _validate_attention_inputs(
     num_requests = history_page_table.shape[0]
     if num_requests <= 0:
         raise ValueError("history page table must contain at least one request")
+    _require_cuda_tensor(
+        rope_block_table,
+        name="rope_block_table",
+        ndim=2,
+        dtype=(torch.int32, torch.int64),
+    )
+    if rope_block_table.shape[0] != num_requests:
+        raise ValueError("RoPE block table must have one row per request")
     for name, tensor in (("hp_rows", hp_rows), ("seq_lens", seq_lens)):
         _require_cuda_tensor(
             tensor,
@@ -481,11 +559,14 @@ def _validate_attention_inputs(
         raise ValueError("rotation shape must match query latent rank")
     device = query.device
     tensors = (
+        query_rope,
         selected_tokens,
         query_request_indices,
         query_positions,
         prefix,
         recent,
+        rope,
+        rope_block_table,
         history_data,
         history_scale,
         history_zero,
@@ -501,11 +582,14 @@ def _validate_attention_inputs(
 
 def _oscar_mla_sparse_attention(
     query: torch.Tensor,
+    query_rope: torch.Tensor,
     selected_tokens: torch.Tensor,
     query_request_indices: torch.Tensor,
     query_positions: torch.Tensor,
     prefix: torch.Tensor,
     recent: torch.Tensor,
+    rope: torch.Tensor,
+    rope_block_table: torch.Tensor,
     history_data: torch.Tensor,
     history_scale: torch.Tensor,
     history_zero: torch.Tensor,
@@ -525,11 +609,14 @@ def _oscar_mla_sparse_attention(
     """Attend directly to causal DSA-selected tokens across all latent pools."""
     num_queries, num_heads, latent_rank, group_size = _validate_attention_inputs(
         query,
+        query_rope,
         selected_tokens,
         query_request_indices,
         query_positions,
         prefix,
         recent,
+        rope,
+        rope_block_table,
         history_data,
         history_scale,
         history_zero,
@@ -542,7 +629,11 @@ def _oscar_mla_sparse_attention(
         raise ValueError("num_splits must be in [1, 32]")
     topk = selected_tokens.shape[1]
     num_splits = min(num_splits, topk)
-    attention_scale = latent_rank**-0.5 if attention_scale is None else attention_scale
+    attention_scale = (
+        (latent_rank + query_rope.shape[2]) ** -0.5
+        if attention_scale is None
+        else attention_scale
+    )
     if not math.isfinite(attention_scale) or attention_scale <= 0:
         raise ValueError("attention_scale must be finite and positive")
 
@@ -590,11 +681,14 @@ def _oscar_mla_sparse_attention(
     _mixed_sparse_decode_stage1[(num_queries, num_heads, num_splits)](
         query,
         query_rotated,
+        query_rope,
         selected_tokens,
         query_request_indices,
         query_positions,
         prefix,
         recent,
+        rope,
+        rope_block_table,
         history_data,
         history_scale,
         history_zero,
@@ -610,6 +704,9 @@ def _oscar_mla_sparse_attention(
         stride_query_rotated_b=query_rotated.stride(0),
         stride_query_rotated_h=query_rotated.stride(1),
         stride_query_rotated_d=query_rotated.stride(2),
+        stride_query_rope_b=query_rope.stride(0),
+        stride_query_rope_h=query_rope.stride(1),
+        stride_query_rope_d=query_rope.stride(2),
         stride_selected_b=selected_tokens.stride(0),
         stride_selected_k=selected_tokens.stride(1),
         stride_query_request=query_request_indices.stride(0),
@@ -620,6 +717,11 @@ def _oscar_mla_sparse_attention(
         stride_recent_row=recent.stride(0),
         stride_recent_token=recent.stride(1),
         stride_recent_d=recent.stride(2),
+        stride_rope_block=rope.stride(0),
+        stride_rope_token=rope.stride(1),
+        stride_rope_d=rope.stride(2),
+        stride_rope_block_table_b=rope_block_table.stride(0),
+        stride_rope_block_table_page=rope_block_table.stride(1),
         stride_data_page=history_data.stride(0),
         stride_data_token=history_data.stride(1),
         stride_data_byte=history_data.stride(2),
@@ -644,6 +746,8 @@ def _oscar_mla_sparse_attention(
         topk=topk,
         prefix_tokens=prefix.shape[1],
         recent_tokens=recent.shape[1],
+        rope_block_size=rope.shape[1],
+        rope_head_size=rope.shape[2],
         history_block_size=history_data.shape[1],
         latent_rank=latent_rank,
         group_size=group_size,
@@ -652,6 +756,7 @@ def _oscar_mla_sparse_attention(
         num_requests=seq_lens.shape[0],
         block_t=block_t,
         block_d=block_d,
+        block_r=triton.next_power_of_2(rope.shape[2]),
         num_warps=4,
         num_stages=1,
     )
@@ -742,9 +847,12 @@ def _oscar_mla_sparse_attention(
 
 def oscar_mla_sparse_decode(
     query: torch.Tensor,
+    query_rope: torch.Tensor,
     selected_tokens: torch.Tensor,
     prefix: torch.Tensor,
     recent: torch.Tensor,
+    rope: torch.Tensor,
+    rope_block_table: torch.Tensor,
     history_data: torch.Tensor,
     history_scale: torch.Tensor,
     history_zero: torch.Tensor,
@@ -772,11 +880,14 @@ def oscar_mla_sparse_decode(
     query_positions = seq_lens - 1
     return _oscar_mla_sparse_attention(
         query,
+        query_rope,
         selected_tokens,
         query_request_indices,
         query_positions,
         prefix,
         recent,
+        rope,
+        rope_block_table,
         history_data,
         history_scale,
         history_zero,
@@ -796,11 +907,14 @@ def oscar_mla_sparse_decode(
 
 def oscar_mla_sparse_prefill(
     query: torch.Tensor,
+    query_rope: torch.Tensor,
     selected_tokens: torch.Tensor,
     query_request_indices: torch.Tensor,
     query_positions: torch.Tensor,
     prefix: torch.Tensor,
     recent: torch.Tensor,
+    rope: torch.Tensor,
+    rope_block_table: torch.Tensor,
     history_data: torch.Tensor,
     history_scale: torch.Tensor,
     history_zero: torch.Tensor,
@@ -820,11 +934,14 @@ def oscar_mla_sparse_prefill(
     """Attend multi-token prefill queries with request mapping and causality."""
     return _oscar_mla_sparse_attention(
         query,
+        query_rope,
         selected_tokens,
         query_request_indices,
         query_positions,
         prefix,
         recent,
+        rope,
+        rope_block_table,
         history_data,
         history_scale,
         history_zero,
