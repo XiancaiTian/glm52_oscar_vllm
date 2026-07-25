@@ -262,7 +262,12 @@ batched_history = store.oscar_mla_dequantize_history(
 batched_output, batched_lse = decode.oscar_mla_sparse_decode(
     batched_query,
     batched_query_rope,
-    torch.arange(sequence_length, dtype=torch.int32).repeat(request_count, 1),
+    torch.cat(
+        (
+            torch.arange(sequence_length, dtype=torch.int32),
+            torch.tensor([-1], dtype=torch.int32),
+        )
+    ).repeat(request_count, 1),
     batched_prefix,
     batched_recent,
     batched_rope_cache,
