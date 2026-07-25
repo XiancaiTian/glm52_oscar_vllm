@@ -89,6 +89,10 @@ def test_mla_layer_builds_oscar_three_pool_spec() -> None:
         ),
         ({"kv_transfer_config": SimpleNamespace()}, "KV transfer"),
         (
+            {"scheduler_config": SimpleNamespace(async_scheduling=True)},
+            "asynchronous scheduling",
+        ),
+        (
             {"cache_config": SimpleNamespace(kv_offloading_size=8)},
             "KV offloading",
         ),
@@ -109,6 +113,7 @@ def test_oscar_runtime_rejects_unimplemented_modes(
         ),
         kv_transfer_config=None,
         cache_config=SimpleNamespace(kv_offloading_size=None),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
     )
     for name, value in override.items():
         setattr(config, name, value)
