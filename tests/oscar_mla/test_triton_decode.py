@@ -390,6 +390,182 @@ def test_sparse_decode_respects_selected_token_ids() -> None:
 
 
 @requires_cuda
+@pytest.mark.parametrize("batch_size", [4, 8])
+def test_sparse_decode_isolates_batched_requests(batch_size: int) -> None:
+    device = torch.device("cuda")
+    dim = 512
+    seq_len = 321
+    block_size = 16
+    blocks_per_request = (seq_len + block_size - 1) // block_size
+    generator = torch.Generator(device=device).manual_seed(83 + batch_size)
+    latent = torch.randn(
+        batch_size,
+        seq_len,
+        dim,
+        generator=generator,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    query = torch.randn(
+        batch_size,
+        1,
+        dim,
+        generator=generator,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    rope_values = torch.randn(
+        batch_size,
+        seq_len,
+        64,
+        generator=generator,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    query_rope = torch.randn(
+        batch_size,
+        1,
+        64,
+        generator=generator,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    rotation = _rotation(dim, device=device)
+    prefix = torch.zeros(
+        batch_size,
+        64,
+        dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    recent = torch.zeros(
+        batch_size,
+        256,
+        dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    positions = torch.arange(seq_len, dtype=torch.int32, device=device).repeat(
+        batch_size
+    )
+    hp_rows_for_tokens = torch.arange(
+        batch_size,
+        dtype=torch.int32,
+        device=device,
+    ).repeat_interleave(seq_len)
+    oscar_mla_store_bf16(
+        latent.flatten(0, 1),
+        prefix,
+        recent,
+        positions,
+        torch.full_like(positions, seq_len),
+        hp_rows_for_tokens,
+    )
+
+    rope_cache = torch.zeros(
+        batch_size * blocks_per_request,
+        block_size,
+        64,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    for request_index in range(batch_size):
+        request_cache = rope_cache[
+            request_index * blocks_per_request : (request_index + 1)
+            * blocks_per_request
+        ]
+        request_cache.view(-1, 64)[:seq_len].copy_(rope_values[request_index])
+    rope_block_table = torch.arange(
+        batch_size * blocks_per_request,
+        dtype=torch.int32,
+        device=device,
+    ).view(batch_size, blocks_per_request)
+
+    history_data = torch.zeros(
+        batch_size,
+        block_size,
+        dim // 4,
+        dtype=torch.uint8,
+        device=device,
+    )
+    history_scale = torch.zeros(
+        batch_size,
+        block_size,
+        dim // 128,
+        dtype=torch.float32,
+        device=device,
+    )
+    history_zero = torch.zeros_like(history_scale)
+    page_ids = torch.arange(batch_size, dtype=torch.int32, device=device)
+    page_offsets = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    oscar_mla_rotate_quantize_store(
+        latent[:, 64],
+        rotation,
+        history_data,
+        history_scale,
+        history_zero,
+        page_ids,
+        page_offsets,
+        clip_ratio=0.96,
+    )
+    history_rotated = oscar_mla_dequantize_history(
+        history_data,
+        history_scale,
+        history_zero,
+        page_ids,
+        page_offsets,
+    )
+    selected = torch.tensor(
+        [0, 64, 320],
+        dtype=torch.int32,
+        device=device,
+    ).repeat(batch_size, 1)
+    output, lse = oscar_mla_sparse_decode(
+        query,
+        query_rope,
+        selected,
+        prefix,
+        recent,
+        rope_cache,
+        rope_block_table,
+        history_data,
+        history_scale,
+        history_zero,
+        page_ids.unsqueeze(1),
+        torch.arange(batch_size, dtype=torch.int32, device=device),
+        torch.full((batch_size,), seq_len, dtype=torch.int32, device=device),
+        rotation,
+        num_splits=3,
+    )
+
+    expected_rows = []
+    expected_lse_rows = []
+    for request_index in range(batch_size):
+        expected_row, expected_lse_row = mixed_latent_attention_with_lse(
+            query[request_index : request_index + 1].float(),
+            prefix_latent=latent[request_index, 0:1].float(),
+            recent_latent=latent[request_index, 320:321].float(),
+            history_rotated=history_rotated[request_index : request_index + 1],
+            rotation=rotation.float(),
+            query_rope=query_rope[request_index : request_index + 1].float(),
+            prefix_rope=rope_values[request_index, 0:1].float(),
+            history_rope=rope_values[request_index, 64:65].float(),
+            recent_rope=rope_values[request_index, 320:321].float(),
+        )
+        expected_rows.append(expected_row)
+        expected_lse_rows.append(expected_lse_row)
+    _assert_oracle(
+        output,
+        lse,
+        torch.cat(expected_rows),
+        torch.cat(expected_lse_rows),
+        label=f"decode_batch={batch_size}",
+    )
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(lse).all()
+
+
+@requires_cuda
 @pytest.mark.parametrize("num_queries", [1, 4, 8])
 def test_sparse_prefill_is_causal_and_matches_three_pool_oracle(
     num_queries: int,
