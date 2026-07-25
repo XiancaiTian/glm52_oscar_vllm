@@ -21,6 +21,11 @@ latent_rank = 512
 sequence_length = 5
 latent = torch.randn(sequence_length, latent_rank, dtype=torch.bfloat16)
 query = torch.randn(1, 1, latent_rank, dtype=torch.bfloat16)
+rope_values = torch.randn(sequence_length, 64, dtype=torch.bfloat16)
+query_rope = torch.randn(1, 1, 64, dtype=torch.bfloat16)
+rope_cache = torch.zeros(1, 16, 64, dtype=torch.bfloat16)
+rope_cache[0, :sequence_length].copy_(rope_values)
+rope_block_table = torch.zeros(1, 1, dtype=torch.int32)
 rotation = torch.eye(latent_rank, dtype=torch.bfloat16)
 prefix = torch.zeros(1, 2, latent_rank, dtype=torch.bfloat16)
 recent = torch.zeros(1, 2, latent_rank, dtype=torch.bfloat16)
@@ -71,9 +76,12 @@ history = store.oscar_mla_dequantize_history(
 )
 output, lse = decode.oscar_mla_sparse_decode(
     query,
+    query_rope,
     torch.arange(sequence_length, dtype=torch.int32).unsqueeze(0),
     prefix,
     recent,
+    rope_cache,
+    rope_block_table,
     history_data,
     history_scale,
     history_zero,
@@ -89,6 +97,10 @@ expected = mixed_latent_attention(
     recent_latent=latent[3:].float(),
     history_rotated=history,
     rotation=rotation.float(),
+    query_rope=query_rope.float(),
+    prefix_rope=rope_values[:2].float(),
+    history_rope=rope_values[2:3].float(),
+    recent_rope=rope_values[3:].float(),
 )
 torch.testing.assert_close(output, expected, atol=1e-5, rtol=1e-5)
 assert bool(output.isfinite().all())
@@ -96,11 +108,14 @@ assert bool(lse.isfinite().all())
 
 prefill_output, prefill_lse = decode.oscar_mla_sparse_prefill(
     query.repeat(2, 1, 1),
+    query_rope.repeat(2, 1, 1),
     torch.arange(sequence_length, dtype=torch.int32).repeat(2, 1),
     torch.zeros(2, dtype=torch.int32),
     torch.tensor([2, 4], dtype=torch.int32),
     prefix,
     recent,
+    rope_cache,
+    rope_block_table,
     history_data,
     history_scale,
     history_zero,
@@ -118,6 +133,10 @@ prefill_expected = torch.cat(
             recent_latent=latent[:0].float(),
             history_rotated=history,
             rotation=rotation.float(),
+            query_rope=query_rope.float(),
+            prefix_rope=rope_values[:2].float(),
+            history_rope=rope_values[2:3].float(),
+            recent_rope=rope_values[:0].float(),
         ),
         expected,
     ),
