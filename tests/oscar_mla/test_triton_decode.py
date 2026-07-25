@@ -1,4 +1,7 @@
 import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -20,6 +23,30 @@ requires_cuda = pytest.mark.skipif(
     not RUN_CUDA_TESTS or not torch.cuda.is_available(),
     reason="set VLLM_OSCAR_RUN_CUDA_TESTS=1 on an authorized idle GPU",
 )
+
+
+def test_triton_interpreter_smoke() -> None:
+    env = os.environ.copy()
+    env.update(
+        {
+            "CUDA_VISIBLE_DEVICES": "",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "TRITON_INTERPRET": "1",
+        }
+    )
+    script = Path(__file__).with_name("triton_interpreter_smoke.py")
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "latent_rank=512" in completed.stdout
+    assert "max_error=" in completed.stdout
 
 
 def _rotation(dim: int, *, device: torch.device) -> torch.Tensor:

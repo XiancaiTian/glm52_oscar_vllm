@@ -51,13 +51,18 @@ def _rotate_latent_kernel(
             latent_ptrs,
             mask=(rows[:, None] < num_rows) & k_mask[None, :],
             other=0.0,
-        ).to(tl.bfloat16)
+        ).to(tl.float32)
         rotation = tl.load(
             rotation_ptrs,
             mask=k_mask[:, None] & (cols[None, :] < latent_rank),
             other=0.0,
-        ).to(tl.bfloat16)
-        accumulator = tl.dot(latent, rotation, accumulator)
+        ).to(tl.float32)
+        accumulator = tl.dot(
+            latent,
+            rotation,
+            accumulator,
+            input_precision="ieee",
+        )
         latent_ptrs += block_k * stride_latent_dim
         rotation_ptrs += block_k * stride_rotation_row
 

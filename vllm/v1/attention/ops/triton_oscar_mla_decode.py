@@ -284,8 +284,9 @@ def _merge_mixed_splits_kernel(
         other=-float("inf"),
     ).to(tl.float32)
     maximum = tl.max(lse, axis=0)
-    finite = maximum != -float("inf")
-    weights = tl.where(split_mask & finite, tl.exp(lse - maximum), 0.0)
+    finite = maximum > -float("inf")
+    weights = tl.where(split_mask, tl.exp(lse - maximum), 0.0)
+    weights = tl.where(finite, weights, 0.0)
     denominator = tl.sum(weights, axis=0)
     weights = weights / tl.where(denominator > 0.0, denominator, 1.0)
 
