@@ -215,3 +215,68 @@ def test_runtime_read_uses_local_dsa_ids_and_three_pool_cache(monkeypatch) -> No
     assert captured["query_positions"].tolist() == [320]
     assert captured["block_table"] is metadata.block_table
     assert impl.oscar_read_calls == 1
+
+
+def test_runtime_read_maps_multiple_requests_to_local_positions(monkeypatch) -> None:
+    captured: dict[str, torch.Tensor] = {}
+
+    def _read(*args, **kwargs):
+        captured["selected"] = args[2]
+        captured["request_indices"] = args[3]
+        captured["query_positions"] = args[4]
+        captured["block_table"] = args[8]
+        captured["history_page_table"] = args[12]
+        captured["hp_rows"] = args[13]
+        return torch.ones(3, 2, 512), torch.zeros(3, 2)
+
+    monkeypatch.setattr(triton_mla_sparse, "oscar_mla_sparse_prefill", _read)
+    empty = torch.empty(0, dtype=torch.int32)
+    oscar = OscarMLABatchMetadata(
+        hp_rows=torch.tensor([2, 1], dtype=torch.int32),
+        history_page_table=torch.tensor([[9, 11], [4, 5]], dtype=torch.int32),
+        previous_seq_lens=torch.tensor([320, 335], dtype=torch.int32),
+        demotion_request_indices=empty,
+        demotion_positions=empty,
+        demotion_page_ids=empty,
+        demotion_page_offsets=empty,
+    )
+    metadata = XPUMLASparseMetadata(
+        num_reqs=2,
+        max_query_len=2,
+        max_seq_len=337,
+        num_actual_tokens=3,
+        query_start_loc=torch.tensor([0, 1, 3], dtype=torch.int32),
+        slot_mapping=torch.arange(3, dtype=torch.int32),
+        block_table=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+        req_id_per_token=torch.tensor([0, 1, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([321, 337], dtype=torch.int32),
+        oscar_mla=oscar,
+        block_size=16,
+        base_seq_len=320,
+    )
+    impl = _impl()
+    impl.kv_cache_dtype = "oscar_mla_int2"
+    impl.softmax_scale = 576**-0.5
+    impl.topk_indices_buffer = torch.tensor(
+        [[0, 64, 320], [0, 64, 334], [0, 64, 336]],
+        dtype=torch.int32,
+    )
+
+    output, lse = impl.forward_mqa(
+        (
+            torch.zeros(3, 2, 512, dtype=torch.bfloat16),
+            torch.zeros(3, 2, 64, dtype=torch.bfloat16),
+        ),
+        _cache(),
+        metadata,
+        SimpleNamespace(_oscar_rotation=torch.eye(512)),
+    )
+
+    assert output.shape == (3, 2, 512)
+    assert lse is None
+    assert captured["selected"].tolist() == impl.topk_indices_buffer.tolist()
+    assert captured["request_indices"].tolist() == [0, 1, 1]
+    assert captured["query_positions"].tolist() == [320, 335, 336]
+    assert captured["block_table"] is metadata.block_table
+    assert captured["history_page_table"] is oscar.history_page_table
+    assert captured["hp_rows"] is oscar.hp_rows
