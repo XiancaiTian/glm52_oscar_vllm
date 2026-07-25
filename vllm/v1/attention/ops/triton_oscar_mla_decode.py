@@ -21,6 +21,8 @@ def _mixed_sparse_decode_stage1(
     query_ptr,
     query_rotated_ptr,
     selected_tokens_ptr,
+    query_request_indices_ptr,
+    query_positions_ptr,
     prefix_ptr,
     recent_ptr,
     history_data_ptr,
@@ -40,6 +42,8 @@ def _mixed_sparse_decode_stage1(
     stride_query_rotated_d: tl.constexpr,
     stride_selected_b: tl.constexpr,
     stride_selected_k: tl.constexpr,
+    stride_query_request: tl.constexpr,
+    stride_query_position: tl.constexpr,
     stride_prefix_row: tl.constexpr,
     stride_prefix_token: tl.constexpr,
     stride_prefix_d: tl.constexpr,
@@ -57,6 +61,8 @@ def _mixed_sparse_decode_stage1(
     stride_zero_group: tl.constexpr,
     stride_page_table_b: tl.constexpr,
     stride_page_table_page: tl.constexpr,
+    stride_hp_rows: tl.constexpr,
+    stride_seq_lens: tl.constexpr,
     stride_mid_b: tl.constexpr,
     stride_mid_h: tl.constexpr,
     stride_mid_split: tl.constexpr,
@@ -73,18 +79,25 @@ def _mixed_sparse_decode_stage1(
     group_size: tl.constexpr,
     packed_group_bytes: tl.constexpr,
     attention_scale: tl.constexpr,
+    num_requests: tl.constexpr,
     block_t: tl.constexpr,
     block_d: tl.constexpr,
 ):
-    request = tl.program_id(0)
+    query_row = tl.program_id(0)
     head = tl.program_id(1)
     split = tl.program_id(2)
+    request = tl.load(
+        query_request_indices_ptr + query_row * stride_query_request,
+    )
+    request_valid = (request >= 0) & (request < num_requests)
+    safe_request = tl.where(request_valid, request, 0)
+    query_position = tl.load(query_positions_ptr + query_row * stride_query_position)
 
     dims = tl.arange(0, block_d)
     dim_mask = dims < latent_rank
     query = tl.load(
         query_ptr
-        + request * stride_query_b
+        + query_row * stride_query_b
         + head * stride_query_h
         + dims * stride_query_d,
         mask=dim_mask,
@@ -92,14 +105,15 @@ def _mixed_sparse_decode_stage1(
     ).to(tl.float32)
     query_rotated = tl.load(
         query_rotated_ptr
-        + request * stride_query_rotated_b
+        + query_row * stride_query_rotated_b
         + head * stride_query_rotated_h
         + dims * stride_query_rotated_d,
         mask=dim_mask,
         other=0.0,
     ).to(tl.float32)
-    hp_row = tl.load(hp_rows_ptr + request)
-    seq_len = tl.load(seq_lens_ptr + request)
+    hp_row = tl.load(hp_rows_ptr + safe_request * stride_hp_rows)
+    seq_len = tl.load(seq_lens_ptr + safe_request * stride_seq_lens)
+    causal_seq_len = tl.minimum(seq_len, query_position + 1)
     recent_start = tl.maximum(prefix_tokens, seq_len - recent_tokens)
 
     split_len = tl.cdiv(topk, num_splits)
@@ -116,12 +130,19 @@ def _mixed_sparse_decode_stage1(
         selected_mask = selected_offsets < split_end
         tokens = tl.load(
             selected_tokens_ptr
-            + request * stride_selected_b
+            + query_row * stride_selected_b
             + selected_offsets * stride_selected_k,
             mask=selected_mask,
             other=-1,
         )
-        valid = selected_mask & (tokens >= 0) & (tokens < seq_len) & (hp_row >= 0)
+        valid = (
+            selected_mask
+            & request_valid
+            & (query_position >= 0)
+            & (tokens >= 0)
+            & (tokens < causal_seq_len)
+            & (hp_row >= 0)
+        )
         is_prefix = valid & (tokens < prefix_tokens)
         is_recent = valid & (tokens >= recent_start)
         is_history = valid & ~is_prefix & ~is_recent
@@ -150,7 +171,7 @@ def _mixed_sparse_decode_stage1(
         page_offsets = history_indices % history_block_size
         physical_pages = tl.load(
             history_page_table_ptr
-            + request * stride_page_table_b
+            + safe_request * stride_page_table_b
             + logical_pages * stride_page_table_page,
             mask=is_history,
             other=0,
@@ -221,7 +242,7 @@ def _mixed_sparse_decode_stage1(
             m_prev = m_new
 
     safe_l = tl.where(l_prev > 0.0, l_prev, 1.0)
-    mid_base = request * stride_mid_b + head * stride_mid_h + split * stride_mid_split
+    mid_base = query_row * stride_mid_b + head * stride_mid_h + split * stride_mid_split
     tl.store(
         mid_bf16_ptr + mid_base + dims * stride_mid_d,
         bf16_acc / safe_l,
@@ -239,7 +260,7 @@ def _mixed_sparse_decode_stage1(
     )
     tl.store(
         mid_lse_ptr
-        + request * stride_lse_b
+        + query_row * stride_lse_b
         + head * stride_lse_h
         + split * stride_lse_split,
         local_lse,
@@ -368,9 +389,11 @@ def _add_outputs_kernel(
     )
 
 
-def _validate_decode_inputs(
+def _validate_attention_inputs(
     query: torch.Tensor,
     selected_tokens: torch.Tensor,
+    query_request_indices: torch.Tensor,
+    query_positions: torch.Tensor,
     prefix: torch.Tensor,
     recent: torch.Tensor,
     history_data: torch.Tensor,
@@ -387,15 +410,29 @@ def _validate_decode_inputs(
         ndim=3,
         dtype=(torch.bfloat16, torch.float16, torch.float32),
     )
-    batch_size, num_heads, latent_rank = query.shape
+    num_queries, num_heads, latent_rank = query.shape
+    if num_queries <= 0 or num_heads <= 0 or latent_rank <= 0:
+        raise ValueError("query dimensions must all be positive")
     _require_cuda_tensor(
         selected_tokens,
         name="selected_tokens",
         ndim=2,
         dtype=(torch.int32, torch.int64),
     )
-    if selected_tokens.shape[0] != batch_size or selected_tokens.shape[1] <= 0:
-        raise ValueError("selected tokens must be non-empty with one row per request")
+    if selected_tokens.shape[0] != num_queries or selected_tokens.shape[1] <= 0:
+        raise ValueError("selected tokens must be non-empty with one row per query")
+    for name, tensor in (
+        ("query_request_indices", query_request_indices),
+        ("query_positions", query_positions),
+    ):
+        _require_cuda_tensor(
+            tensor,
+            name=name,
+            ndim=1,
+            dtype=(torch.int32, torch.int64),
+        )
+        if tensor.shape[0] != num_queries:
+            raise ValueError(f"{name} must have one entry per query")
     for name, tensor in (("prefix", prefix), ("recent", recent)):
         _require_cuda_tensor(
             tensor,
@@ -422,8 +459,9 @@ def _validate_decode_inputs(
         ndim=2,
         dtype=(torch.int32, torch.int64),
     )
-    if history_page_table.shape[0] != batch_size:
-        raise ValueError("history page table must have one row per request")
+    num_requests = history_page_table.shape[0]
+    if num_requests <= 0:
+        raise ValueError("history page table must contain at least one request")
     for name, tensor in (("hp_rows", hp_rows), ("seq_lens", seq_lens)):
         _require_cuda_tensor(
             tensor,
@@ -431,7 +469,7 @@ def _validate_decode_inputs(
             ndim=1,
             dtype=(torch.int32, torch.int64),
         )
-        if tensor.shape[0] != batch_size:
+        if tensor.shape[0] != num_requests:
             raise ValueError(f"{name} must have one entry per request")
     _require_cuda_tensor(
         rotation,
@@ -444,6 +482,8 @@ def _validate_decode_inputs(
     device = query.device
     tensors = (
         selected_tokens,
+        query_request_indices,
+        query_positions,
         prefix,
         recent,
         history_data,
@@ -455,13 +495,15 @@ def _validate_decode_inputs(
         rotation,
     )
     if any(tensor.device != device for tensor in tensors):
-        raise ValueError("all OSCAR MLA decode tensors must share one CUDA device")
-    return batch_size, num_heads, latent_rank, group_size
+        raise ValueError("all OSCAR MLA attention tensors must share one CUDA device")
+    return num_queries, num_heads, latent_rank, group_size
 
 
-def oscar_mla_sparse_decode(
+def _oscar_mla_sparse_attention(
     query: torch.Tensor,
     selected_tokens: torch.Tensor,
+    query_request_indices: torch.Tensor,
+    query_positions: torch.Tensor,
     prefix: torch.Tensor,
     recent: torch.Tensor,
     history_data: torch.Tensor,
@@ -480,10 +522,12 @@ def oscar_mla_sparse_decode(
     output: torch.Tensor | None = None,
     output_lse: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Attend directly to DSA-selected tokens across all three latent pools."""
-    batch_size, num_heads, latent_rank, group_size = _validate_decode_inputs(
+    """Attend directly to causal DSA-selected tokens across all latent pools."""
+    num_queries, num_heads, latent_rank, group_size = _validate_attention_inputs(
         query,
         selected_tokens,
+        query_request_indices,
+        query_positions,
         prefix,
         recent,
         history_data,
@@ -502,13 +546,13 @@ def oscar_mla_sparse_decode(
     if not math.isfinite(attention_scale) or attention_scale <= 0:
         raise ValueError("attention_scale must be finite and positive")
 
-    flat_query = query.reshape(batch_size * num_heads, latent_rank)
+    flat_query = query.reshape(num_queries * num_heads, latent_rank)
     query_rotated = oscar_mla_rotate(flat_query, rotation).view(
-        batch_size,
+        num_queries,
         num_heads,
         latent_rank,
     )
-    mid_shape = (batch_size, num_heads, num_splits, latent_rank)
+    mid_shape = (num_queries, num_heads, num_splits, latent_rank)
     for name, tensor in (
         ("mid_bf16", mid_bf16),
         ("mid_history", mid_history),
@@ -529,12 +573,12 @@ def oscar_mla_sparse_decode(
         mid_history = torch.empty_like(mid_bf16)
     if mid_lse is None:
         mid_lse = torch.empty(
-            (batch_size, num_heads, num_splits),
+            (num_queries, num_heads, num_splits),
             dtype=torch.float32,
             device=query.device,
         )
     elif (
-        mid_lse.shape != (batch_size, num_heads, num_splits)
+        mid_lse.shape != (num_queries, num_heads, num_splits)
         or mid_lse.dtype != torch.float32
         or mid_lse.device != query.device
     ):
@@ -543,10 +587,12 @@ def oscar_mla_sparse_decode(
     block_d = triton.next_power_of_2(latent_rank)
     block_t = 16
     packed_group_bytes = group_size // 4
-    _mixed_sparse_decode_stage1[(batch_size, num_heads, num_splits)](
+    _mixed_sparse_decode_stage1[(num_queries, num_heads, num_splits)](
         query,
         query_rotated,
         selected_tokens,
+        query_request_indices,
+        query_positions,
         prefix,
         recent,
         history_data,
@@ -566,6 +612,8 @@ def oscar_mla_sparse_decode(
         stride_query_rotated_d=query_rotated.stride(2),
         stride_selected_b=selected_tokens.stride(0),
         stride_selected_k=selected_tokens.stride(1),
+        stride_query_request=query_request_indices.stride(0),
+        stride_query_position=query_positions.stride(0),
         stride_prefix_row=prefix.stride(0),
         stride_prefix_token=prefix.stride(1),
         stride_prefix_d=prefix.stride(2),
@@ -583,6 +631,8 @@ def oscar_mla_sparse_decode(
         stride_zero_group=history_zero.stride(2),
         stride_page_table_b=history_page_table.stride(0),
         stride_page_table_page=history_page_table.stride(1),
+        stride_hp_rows=hp_rows.stride(0),
+        stride_seq_lens=seq_lens.stride(0),
         stride_mid_b=mid_bf16.stride(0),
         stride_mid_h=mid_bf16.stride(1),
         stride_mid_split=mid_bf16.stride(2),
@@ -599,13 +649,14 @@ def oscar_mla_sparse_decode(
         group_size=group_size,
         packed_group_bytes=packed_group_bytes,
         attention_scale=attention_scale,
+        num_requests=seq_lens.shape[0],
         block_t=block_t,
         block_d=block_d,
         num_warps=4,
         num_stages=1,
     )
 
-    merged_shape = (batch_size, num_heads, latent_rank)
+    merged_shape = (num_queries, num_heads, latent_rank)
     bf16_merged = torch.empty(
         merged_shape,
         dtype=torch.float32,
@@ -614,17 +665,17 @@ def oscar_mla_sparse_decode(
     history_merged = torch.empty_like(bf16_merged)
     if output_lse is None:
         output_lse = torch.empty(
-            (batch_size, num_heads),
+            (num_queries, num_heads),
             dtype=torch.float32,
             device=query.device,
         )
     elif (
-        output_lse.shape != (batch_size, num_heads)
+        output_lse.shape != (num_queries, num_heads)
         or output_lse.dtype != torch.float32
         or output_lse.device != query.device
     ):
         raise ValueError("output_lse has incompatible shape, dtype, or device")
-    _merge_mixed_splits_kernel[(batch_size, num_heads)](
+    _merge_mixed_splits_kernel[(num_queries, num_heads)](
         mid_bf16,
         mid_history,
         mid_lse,
@@ -651,7 +702,7 @@ def oscar_mla_sparse_decode(
         num_stages=1,
     )
 
-    flat_history = history_merged.view(batch_size * num_heads, latent_rank)
+    flat_history = history_merged.view(num_queries * num_heads, latent_rank)
     history_original = oscar_mla_rotate(
         flat_history,
         rotation.T,
@@ -668,13 +719,13 @@ def oscar_mla_sparse_decode(
         or output.device != query.device
     ):
         raise ValueError("output has incompatible shape, dtype, or device")
-    flat_bf16 = bf16_merged.view(batch_size * num_heads, latent_rank)
-    flat_output = output.view(batch_size * num_heads, latent_rank)
-    _add_outputs_kernel[(batch_size * num_heads,)](
+    flat_bf16 = bf16_merged.view(num_queries * num_heads, latent_rank)
+    flat_output = output.view(num_queries * num_heads, latent_rank)
+    _add_outputs_kernel[(num_queries * num_heads,)](
         flat_bf16,
         history_original,
         flat_output,
-        batch_size * num_heads,
+        num_queries * num_heads,
         latent_rank=latent_rank,
         stride_left_row=flat_bf16.stride(0),
         stride_left_d=flat_bf16.stride(1),
@@ -687,3 +738,105 @@ def oscar_mla_sparse_decode(
         num_stages=1,
     )
     return output, output_lse
+
+
+def oscar_mla_sparse_decode(
+    query: torch.Tensor,
+    selected_tokens: torch.Tensor,
+    prefix: torch.Tensor,
+    recent: torch.Tensor,
+    history_data: torch.Tensor,
+    history_scale: torch.Tensor,
+    history_zero: torch.Tensor,
+    history_page_table: torch.Tensor,
+    hp_rows: torch.Tensor,
+    seq_lens: torch.Tensor,
+    rotation: torch.Tensor,
+    *,
+    attention_scale: float | None = None,
+    num_splits: int = 16,
+    mid_bf16: torch.Tensor | None = None,
+    mid_history: torch.Tensor | None = None,
+    mid_lse: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+    output_lse: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Attend one decode query per request to DSA-selected cache tokens."""
+    if query.shape[0] != seq_lens.shape[0]:
+        raise ValueError("decode requires exactly one query per request")
+    query_request_indices = torch.arange(
+        query.shape[0],
+        dtype=torch.int32,
+        device=query.device,
+    )
+    query_positions = seq_lens - 1
+    return _oscar_mla_sparse_attention(
+        query,
+        selected_tokens,
+        query_request_indices,
+        query_positions,
+        prefix,
+        recent,
+        history_data,
+        history_scale,
+        history_zero,
+        history_page_table,
+        hp_rows,
+        seq_lens,
+        rotation,
+        attention_scale=attention_scale,
+        num_splits=num_splits,
+        mid_bf16=mid_bf16,
+        mid_history=mid_history,
+        mid_lse=mid_lse,
+        output=output,
+        output_lse=output_lse,
+    )
+
+
+def oscar_mla_sparse_prefill(
+    query: torch.Tensor,
+    selected_tokens: torch.Tensor,
+    query_request_indices: torch.Tensor,
+    query_positions: torch.Tensor,
+    prefix: torch.Tensor,
+    recent: torch.Tensor,
+    history_data: torch.Tensor,
+    history_scale: torch.Tensor,
+    history_zero: torch.Tensor,
+    history_page_table: torch.Tensor,
+    hp_rows: torch.Tensor,
+    seq_lens: torch.Tensor,
+    rotation: torch.Tensor,
+    *,
+    attention_scale: float | None = None,
+    num_splits: int = 16,
+    mid_bf16: torch.Tensor | None = None,
+    mid_history: torch.Tensor | None = None,
+    mid_lse: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+    output_lse: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Attend multi-token prefill queries with request mapping and causality."""
+    return _oscar_mla_sparse_attention(
+        query,
+        selected_tokens,
+        query_request_indices,
+        query_positions,
+        prefix,
+        recent,
+        history_data,
+        history_scale,
+        history_zero,
+        history_page_table,
+        hp_rows,
+        seq_lens,
+        rotation,
+        attention_scale=attention_scale,
+        num_splits=num_splits,
+        mid_bf16=mid_bf16,
+        mid_history=mid_history,
+        mid_lse=mid_lse,
+        output=output,
+        output_lse=output_lse,
+    )

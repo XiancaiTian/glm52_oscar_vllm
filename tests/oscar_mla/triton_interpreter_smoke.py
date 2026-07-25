@@ -93,9 +93,48 @@ expected = mixed_latent_attention(
 torch.testing.assert_close(output, expected, atol=1e-5, rtol=1e-5)
 assert bool(output.isfinite().all())
 assert bool(lse.isfinite().all())
+
+prefill_output, prefill_lse = decode.oscar_mla_sparse_prefill(
+    query.repeat(2, 1, 1),
+    torch.arange(sequence_length, dtype=torch.int32).repeat(2, 1),
+    torch.zeros(2, dtype=torch.int32),
+    torch.tensor([2, 4], dtype=torch.int32),
+    prefix,
+    recent,
+    history_data,
+    history_scale,
+    history_zero,
+    torch.zeros(1, 1, dtype=torch.int32),
+    zero_index,
+    torch.tensor([sequence_length], dtype=torch.int32),
+    rotation,
+    num_splits=2,
+)
+prefill_expected = torch.cat(
+    (
+        mixed_latent_attention(
+            query.float(),
+            prefix_latent=latent[:2].float(),
+            recent_latent=latent[:0].float(),
+            history_rotated=history,
+            rotation=rotation.float(),
+        ),
+        expected,
+    ),
+    dim=0,
+)
+torch.testing.assert_close(
+    prefill_output,
+    prefill_expected,
+    atol=1e-5,
+    rtol=1e-5,
+)
+assert bool(prefill_output.isfinite().all())
+assert bool(prefill_lse.isfinite().all())
 print(
     "interpreter_smoke",
     f"latent_rank={latent_rank}",
     f"groups={history_scale.shape[-1]}",
     f"max_error={(output - expected).abs().max().item()}",
+    f"prefill_max_error={(prefill_output - prefill_expected).abs().max().item()}",
 )

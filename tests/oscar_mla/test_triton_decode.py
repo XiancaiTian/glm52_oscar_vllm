@@ -11,6 +11,7 @@ from vllm.model_executor.layers.quantization.oscar_mla.reference import (
 )
 from vllm.v1.attention.ops.triton_oscar_mla_decode import (
     oscar_mla_sparse_decode,
+    oscar_mla_sparse_prefill,
 )
 from vllm.v1.attention.ops.triton_oscar_mla_store import (
     oscar_mla_dequantize_history,
@@ -47,6 +48,7 @@ def test_triton_interpreter_smoke() -> None:
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "latent_rank=512" in completed.stdout
     assert "max_error=" in completed.stdout
+    assert "prefill_max_error=" in completed.stdout
 
 
 def _rotation(dim: int, *, device: torch.device) -> torch.Tensor:
@@ -280,3 +282,127 @@ def test_sparse_decode_respects_selected_token_ids() -> None:
         rotation=rotation.float(),
     )
     torch.testing.assert_close(output, expected, atol=0.5, rtol=0.03)
+
+
+@requires_cuda
+@pytest.mark.parametrize("num_queries", [1, 4, 8])
+def test_sparse_prefill_is_causal_and_matches_three_pool_oracle(
+    num_queries: int,
+) -> None:
+    device = torch.device("cuda")
+    dim = 512
+    seq_len = 321
+    block_size = 16
+    generator = torch.Generator(device=device).manual_seed(97 + num_queries)
+    latent = torch.randn(
+        seq_len,
+        dim,
+        generator=generator,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    query = torch.randn(
+        num_queries,
+        1,
+        dim,
+        generator=generator,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    rotation = _rotation(dim, device=device)
+    prefix = torch.zeros(1, 64, dim, dtype=torch.bfloat16, device=device)
+    recent = torch.zeros(1, 256, dim, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(seq_len, dtype=torch.int32, device=device)
+    oscar_mla_store_bf16(
+        latent,
+        prefix,
+        recent,
+        positions,
+        torch.full_like(positions, seq_len),
+        torch.zeros_like(positions),
+    )
+
+    history_data = torch.zeros(
+        1,
+        block_size,
+        dim // 4,
+        dtype=torch.uint8,
+        device=device,
+    )
+    history_scale = torch.zeros(
+        1,
+        block_size,
+        dim // 128,
+        dtype=torch.float32,
+        device=device,
+    )
+    history_zero = torch.zeros_like(history_scale)
+    zero_index = torch.zeros(1, dtype=torch.int32, device=device)
+    oscar_mla_rotate_quantize_store(
+        latent[64:65],
+        rotation,
+        history_data,
+        history_scale,
+        history_zero,
+        zero_index,
+        zero_index,
+        clip_ratio=0.96,
+    )
+    history_rotated = oscar_mla_dequantize_history(
+        history_data,
+        history_scale,
+        history_zero,
+        zero_index,
+        zero_index,
+    )
+
+    if num_queries == 1:
+        query_positions = torch.tensor([320], dtype=torch.int32, device=device)
+    elif num_queries == 4:
+        query_positions = torch.tensor(
+            [63, 64, 319, 320],
+            dtype=torch.int32,
+            device=device,
+        )
+    else:
+        query_positions = torch.tensor(
+            [63, 64, 100, 150, 200, 250, 319, 320],
+            dtype=torch.int32,
+            device=device,
+        )
+    selected = positions.unsqueeze(0).expand(num_queries, -1)
+    output, lse = oscar_mla_sparse_prefill(
+        query,
+        selected,
+        torch.zeros(num_queries, dtype=torch.int32, device=device),
+        query_positions,
+        prefix,
+        recent,
+        history_data,
+        history_scale,
+        history_zero,
+        zero_index.view(1, 1),
+        zero_index,
+        torch.tensor([seq_len], dtype=torch.int32, device=device),
+        rotation,
+        num_splits=4,
+    )
+
+    expected_rows = []
+    for row, query_position in enumerate(query_positions.tolist()):
+        causal_length = query_position + 1
+        expected_rows.append(
+            mixed_latent_attention(
+                query[row : row + 1].float(),
+                prefix_latent=latent[: min(64, causal_length)].float(),
+                recent_latent=latent[65:causal_length].float(),
+                history_rotated=(
+                    history_rotated if causal_length > 64 else history_rotated[:0]
+                ),
+                rotation=rotation.float(),
+            )
+        )
+    expected = torch.cat(expected_rows, dim=0)
+    torch.testing.assert_close(output, expected, atol=0.5, rtol=0.03)
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(lse).all()
