@@ -2336,6 +2336,8 @@ class GPUModelRunner(
         num_reqs: int,
         total_num_scheduled_tokens: int,
     ) -> tuple[torch.Tensor, SpecDecodeMetadata | None] | None:
+        if self.cache_config.cache_dtype == "oscar_mla_int2":
+            return None
         if not envs.VLLM_STAGE50_DECODE_PREP_FASTPATH:
             return None
         if (
@@ -2533,6 +2535,29 @@ class GPUModelRunner(
             causal=True,
             is_prefilling=is_prefilling,
         )
+        if self.cache_config.cache_dtype == "oscar_mla_int2":
+            if for_cudagraph_capture or num_reqs_padded != num_reqs:
+                raise RuntimeError(
+                    "oscar_mla_int2 does not support CUDA graph padding"
+                )
+            oscar_spec = next(
+                spec
+                for group in kv_cache_groups
+                for spec in (
+                    group.kv_cache_spec.kv_cache_specs.values()
+                    if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                    else (group.kv_cache_spec,)
+                )
+                if isinstance(spec, OscarMLAAttentionSpec)
+            )
+            cm_base.oscar_mla = self.oscar_mla_ownership.build_batch_metadata(
+                self.input_batch.req_ids[:num_reqs],
+                block_size=oscar_spec.block_size,
+                prefix_tokens=oscar_spec.prefix_tokens,
+                recent_tokens=oscar_spec.recent_tokens,
+                device=self.device,
+                padded_size=num_reqs_padded,
+            )
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(

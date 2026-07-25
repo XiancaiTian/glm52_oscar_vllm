@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
+    from vllm.v1.worker.oscar_mla_cache import OscarMLABatchMetadata
 logger = init_logger(__name__)
 
 
@@ -93,6 +94,8 @@ class XPUMLASparseMetadata(AttentionMetadata):
 
     block_table: torch.Tensor
     req_id_per_token: torch.Tensor
+    seq_lens: torch.Tensor
+    oscar_mla: "OscarMLABatchMetadata | None" = None
 
     block_size: int = 1
     topk_tokens: int = 2048
@@ -178,6 +181,8 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
             slot_mapping=common_attn_metadata.slot_mapping,
             block_table=common_attn_metadata.block_table_tensor,
             req_id_per_token=req_id_per_token,
+            seq_lens=common_attn_metadata.seq_lens,
+            oscar_mla=common_attn_metadata.oscar_mla,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
             full_topk_start=full_topk_start,

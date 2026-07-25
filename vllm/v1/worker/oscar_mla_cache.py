@@ -29,6 +29,19 @@ class OscarMLACacheTensors:
     rope: torch.Tensor
 
 
+@dataclass(frozen=True)
+class OscarMLABatchMetadata:
+    """GPU metadata for one scheduled batch of three-pool cache operations."""
+
+    hp_rows: torch.Tensor
+    history_page_table: torch.Tensor
+    previous_seq_lens: torch.Tensor
+    demotion_request_indices: torch.Tensor
+    demotion_positions: torch.Tensor
+    demotion_page_ids: torch.Tensor
+    demotion_page_offsets: torch.Tensor
+
+
 def reshape_oscar_mla_cache(
     raw: torch.Tensor,
     spec: OscarMLAAttentionSpec,
@@ -126,18 +139,23 @@ class OscarMLAWorkerOwnership:
 
     def __init__(self) -> None:
         self._metadata: dict[str, WorkerCacheMetadata] = {}
+        self._previous_lengths: dict[str, int] = {}
 
     def apply(self, scheduler_output: SchedulerOutput) -> None:
         released = set(scheduler_output.finished_req_ids)
         if scheduler_output.preempted_req_ids:
             released.update(scheduler_output.preempted_req_ids)
-        for request_id in released:
-            self._metadata.pop(request_id, None)
+        candidate = {
+            request_id: metadata
+            for request_id, metadata in self._metadata.items()
+            if request_id not in released
+        }
+        previous_lengths: dict[str, int] = {}
 
         for request_id, metadata in scheduler_output.oscar_mla_cache_metadata.items():
             if metadata.request_id != request_id:
                 raise RuntimeError("OSCAR MLA metadata request ID mismatch")
-            previous = self._metadata.get(request_id)
+            previous = candidate.get(request_id)
             if previous is not None:
                 if metadata.generation != previous.generation:
                     raise RuntimeError(
@@ -145,7 +163,99 @@ class OscarMLAWorkerOwnership:
                     )
                 if metadata.cache_version < previous.cache_version:
                     raise RuntimeError("stale OSCAR MLA cache metadata")
-            self._metadata[request_id] = metadata
+            previous_lengths[request_id] = (
+                previous.logical_length if previous is not None else 0
+            )
+            candidate[request_id] = metadata
+        self._metadata = candidate
+        self._previous_lengths = previous_lengths
+
+    def build_batch_metadata(
+        self,
+        request_ids: list[str],
+        *,
+        block_size: int,
+        prefix_tokens: int,
+        recent_tokens: int,
+        device: torch.device,
+        padded_size: int | None = None,
+    ) -> OscarMLABatchMetadata:
+        """Materialize scheduler ownership and incremental demotions on a device."""
+        if block_size <= 0 or prefix_tokens <= 0 or recent_tokens <= 0:
+            raise ValueError("OSCAR MLA cache geometry must be positive")
+        if padded_size is None:
+            padded_size = len(request_ids)
+        if padded_size < len(request_ids):
+            raise ValueError("padded_size cannot be smaller than the request batch")
+
+        rows: list[int] = []
+        previous_seq_lens: list[int] = []
+        metadata_rows: list[WorkerCacheMetadata] = []
+        for request_id in request_ids:
+            metadata = self._metadata[request_id]
+            if metadata.prefix_start != metadata.hp_row * prefix_tokens:
+                raise RuntimeError("OSCAR MLA prefix ownership is inconsistent")
+            if metadata.recent_start != metadata.hp_row * recent_tokens:
+                raise RuntimeError("OSCAR MLA recent ownership is inconsistent")
+            rows.append(metadata.hp_row)
+            previous_seq_lens.append(
+                self._previous_lengths.get(request_id, metadata.logical_length)
+            )
+            metadata_rows.append(metadata)
+
+        max_history_pages = max(
+            1,
+            *(len(metadata.history_pages) for metadata in metadata_rows),
+        )
+        history_page_table = torch.zeros(
+            (padded_size, max_history_pages),
+            dtype=torch.int32,
+            device=device,
+        )
+        for row, metadata in enumerate(metadata_rows):
+            if metadata.history_pages:
+                history_page_table[row, : len(metadata.history_pages)] = torch.tensor(
+                    metadata.history_pages,
+                    dtype=torch.int32,
+                    device=device,
+                )
+
+        demotion_requests: list[int] = []
+        demotion_positions: list[int] = []
+        demotion_pages: list[int] = []
+        demotion_offsets: list[int] = []
+        for request_index, metadata in enumerate(metadata_rows):
+            previous_length = previous_seq_lens[request_index]
+            old_history_end = max(prefix_tokens, previous_length - recent_tokens)
+            new_history_end = max(
+                prefix_tokens,
+                metadata.logical_length - recent_tokens,
+            )
+            demotion_end = min(new_history_end, previous_length)
+            for position in range(old_history_end, demotion_end):
+                history_index = position - prefix_tokens
+                logical_page, page_offset = divmod(history_index, block_size)
+                if logical_page >= len(metadata.history_pages):
+                    raise RuntimeError("OSCAR MLA history ownership is incomplete")
+                demotion_requests.append(request_index)
+                demotion_positions.append(position)
+                demotion_pages.append(metadata.history_pages[logical_page])
+                demotion_offsets.append(page_offset)
+
+        def _device_tensor(values: list[int]) -> torch.Tensor:
+            return torch.tensor(values, dtype=torch.int32, device=device)
+
+        return OscarMLABatchMetadata(
+            hp_rows=_device_tensor(rows + [-1] * (padded_size - len(rows))),
+            history_page_table=history_page_table,
+            previous_seq_lens=_device_tensor(
+                previous_seq_lens + [0] * (padded_size - len(previous_seq_lens))
+            ),
+            demotion_request_indices=_device_tensor(demotion_requests),
+            demotion_positions=_device_tensor(demotion_positions),
+            demotion_page_ids=_device_tensor(demotion_pages),
+            demotion_page_offsets=_device_tensor(demotion_offsets),
+        )
 
     def get(self, request_id: str) -> WorkerCacheMetadata:
         return self._metadata[request_id]

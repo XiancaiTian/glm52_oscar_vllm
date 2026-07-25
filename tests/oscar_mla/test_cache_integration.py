@@ -283,3 +283,49 @@ def test_worker_ownership_rejects_stale_versions_and_handles_reuse() -> None:
     }
     ownership.apply(output)
     assert ownership.get("r0").generation == 2
+
+
+def test_worker_builds_incremental_batch_demotion_metadata() -> None:
+    ownership = OscarMLAWorkerOwnership()
+    output = SchedulerOutput.make_empty()
+    before = WorkerCacheMetadata(
+        request_id="r0",
+        generation=1,
+        cache_version=1,
+        logical_length=320,
+        hp_row=2,
+        prefix_start=128,
+        recent_start=512,
+        history_pages=(),
+        partial_history_slots=0,
+    )
+    output.oscar_mla_cache_metadata = {"r0": before}
+    ownership.apply(output)
+
+    current = WorkerCacheMetadata(
+        **{
+            **before.__dict__,
+            "cache_version": 2,
+            "logical_length": 337,
+            "history_pages": (9, 11),
+            "partial_history_slots": 1,
+        }
+    )
+    output.oscar_mla_cache_metadata = {"r0": current}
+    ownership.apply(output)
+    metadata = ownership.build_batch_metadata(
+        ["r0"],
+        block_size=16,
+        prefix_tokens=64,
+        recent_tokens=256,
+        device=torch.device("cpu"),
+        padded_size=2,
+    )
+
+    assert metadata.hp_rows.tolist() == [2, -1]
+    assert metadata.previous_seq_lens.tolist() == [320, 0]
+    assert metadata.history_page_table.tolist() == [[9, 11], [0, 0]]
+    assert metadata.demotion_request_indices.tolist() == [0] * 17
+    assert metadata.demotion_positions.tolist() == list(range(64, 81))
+    assert metadata.demotion_page_ids.tolist() == [9] * 16 + [11]
+    assert metadata.demotion_page_offsets.tolist() == list(range(16)) + [0]
