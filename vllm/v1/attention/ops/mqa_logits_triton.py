@@ -1,0 +1,1751 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Triton implementations of DeepGEMM's fp8_mqa_logits and
+fp8_paged_mqa_logits for GPUs where DeepGEMM is not available.
+
+The computation is:
+
+    Q, K                := dequant(Q_fp8), dequant(K_fp8) * k_scales
+    score[H, M, N]      = Q[M, H, D] @ K[N, D].T
+    logits[M, N]        = (relu(score) * weights[M, H]).sum(axis=0)
+    logits[M, N]       := -inf  outside of valid range
+
+Q/K are cast to bf16 for the matmul; the matmul uses an fp32 accumulator.
+
+K-side scale multiplication is done in fp32 before downcasting to bf16
+so the per-row dequant scale is applied at full precision.
+"""
+
+import os
+
+import torch
+
+from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
+
+logger = init_logger(__name__)
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default) == "1"
+
+
+def _env_int(name: str, default: str) -> int:
+    return int(os.getenv(name, default) or default)
+
+
+_DECODE_EMPTY_LOGITS = _env_flag("VLLM_SPARSE_INDEXER_DECODE_EMPTY_LOGITS")
+_DECODE_LOGITS_BLOCK_PAGES = _env_int(
+    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES",
+    "1",
+)
+_DECODE_LOGITS_BLOCK_PAGES_WARPS = _env_int(
+    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES_WARPS",
+    "4",
+)
+_DECODE_LOGITS_BLOCK_PAGES_STAGES = _env_int(
+    "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES_STAGES",
+    "3",
+)
+_DECODE_TOPK_TILE_SELECT_CANDIDATES = _env_int(
+    "VLLM_SPARSE_INDEXER_DECODE_TOPK_TILE_SELECT_CANDIDATES",
+    "16",
+)
+_DECODE_FP8_LUT = _env_flag("VLLM_SPARSE_INDEXER_DECODE_FP8_LUT")
+_FP8_E4M3FN_LUT_CACHE: dict[tuple[str, int | None], torch.Tensor] = {}
+
+# Paged decode config sweep. `num_warps=4` dominated in A100/SM80 bench
+# across {2,4,8}×{2,4}; the sub-optimal warps=2/8 picks were 1.5–1.7× slower
+# at the autotune key shape (num_heads=32, head_dim=128, block_size=64), and
+# autotune timing noise occasionally latched onto them. Keep only the two
+# `num_warps=4` configs so that path is always selected.
+_PAGED_AUTOTUNE_CONFIGS = [
+    triton.Config({}, num_warps=4, num_stages=ns) for ns in (2, 4)
+]
+
+# Prefill kernel adds BLOCK_N as a free tile axis along the K dimension.
+# Bench on A100/SM80 at (M=2048, N=8192, H=32, D=128) shows BN=32/64 with
+# num_warps∈{2,4} is within a few % of the best; BN=128 and num_warps=8 are
+# consistently ~1.5–3× worse. Trimming the sweep keeps the good configs and
+# shrinks first-call autotune time.
+_PREFILL_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_N": bn}, num_warps=nw, num_stages=ns)
+    for bn in (32, 64)
+    for nw in (2, 4)
+    for ns in (2, 4)
+]
+
+
+@triton.jit
+def _decode_e4m3fn(u):
+    """Decode an E4M3FN byte (uint8) to fp32 using only uint/int/fp ops.
+
+    Triton on SM80 cannot compile `tl.float8e4nv`, so we never load the
+    FP8 dtype directly — we load uint8 and decode in software here. The
+    expansion is ~6 ops per element, dwarfed by the surrounding matmul.
+
+    E4M3FN: 1 sign + 4 exp (bias 7) + 3 mantissa.  No infinities.
+    Subnormal (exp=0): value = (-1)^s * (mant/8) * 2^(1 - 7)
+    Normal           : value = (-1)^s * (1 + mant/8) * 2^(exp - 7)
+    NaN at 0x7F/0xFF is decoded numerically as ±480 — sparse-MLA inputs
+    never hit this so the loss of NaN propagation is acceptable.
+    """
+    sign = u >> 7
+    exp_bits = ((u >> 3) & 0x0F).to(tl.int32)
+    mant = (u & 0x07).to(tl.int32)
+    is_normal = exp_bits != 0
+    sign_f = tl.where(sign != 0, -1.0, 1.0)
+    mant_f = tl.where(
+        is_normal,
+        (8 + mant).to(tl.float32) * 0.125,
+        mant.to(tl.float32) * 0.125,
+    )
+    # Subnormals: real exponent = 1 - bias.
+    eff_exp = tl.where(is_normal, exp_bits, 1)
+    factor = tl.exp2((eff_exp - 7).to(tl.float32))
+    return sign_f * mant_f * factor
+
+
+@triton.jit
+def _decode_e4m3fn_lut(u, lut_ptr):
+    return tl.load(lut_ptr + u.to(tl.int32))
+
+
+def _fp8_e4m3fn_lut(device: torch.device) -> torch.Tensor:
+    cache_key = (device.type, device.index)
+    cached = _FP8_E4M3FN_LUT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    u = torch.arange(256, device=device, dtype=torch.int32)
+    sign = torch.where((u >> 7) != 0, -1.0, 1.0)
+    exp_bits = (u >> 3) & 0x0F
+    mant = u & 0x07
+    is_normal = exp_bits != 0
+    mant_f = torch.where(
+        is_normal,
+        (8 + mant).to(torch.float32) * 0.125,
+        mant.to(torch.float32) * 0.125,
+    )
+    eff_exp = torch.where(is_normal, exp_bits, torch.ones_like(exp_bits))
+    factor = torch.exp2((eff_exp - 7).to(torch.float32))
+    lut = (sign * mant_f * factor).to(torch.float32).contiguous()
+    _FP8_E4M3FN_LUT_CACHE[cache_key] = lut
+    return lut
+
+
+@triton.jit
+def _topk_step0_hist_bin(x):
+    x_f16 = x.to(tl.float16)
+    bits = x_f16.to(tl.uint16, bitcast=True).to(tl.uint32)
+    ordered = tl.where((bits & 0x8000) != 0, bits, (~bits) & 0x7FFF)
+    return ordered >> 5
+
+
+@triton.autotune(
+    configs=_PAGED_AUTOTUNE_CONFIGS,
+    key=["num_heads", "head_dim", "block_size"],
+)
+@triton.jit
+def _fp8_paged_mqa_logits_kernel(
+    q_ptr,
+    kv_fp8_ptr,
+    kv_scale_ptr,
+    weights_ptr,
+    context_lens_ptr,
+    block_tables_ptr,
+    logits_ptr,
+    topk_hist_ptr,
+    topk_bins_ptr,
+    topk_tile_logits_ptr,
+    topk_tile_indices_ptr,
+    topk_tile_cutoffs_ptr,
+    fp8_lut_ptr,
+    stride_q_b,
+    stride_q_n,
+    stride_q_h,
+    stride_q_d,
+    stride_kvf_block,
+    stride_kvf_s,
+    stride_kvf_d,
+    stride_kvs_block,
+    stride_kvs_s,
+    stride_w_t,
+    stride_w_h,
+    stride_bt_b,
+    stride_bt_k,
+    stride_l_t,
+    stride_l_n,
+    stride_hist_t,
+    stride_bins_t,
+    stride_tile_logits_t,
+    stride_tile_logits_c,
+    stride_tile_indices_t,
+    stride_tile_indices_c,
+    stride_tile_cutoffs_t,
+    stride_tile_cutoffs_g,
+    next_n: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    Q_BF16: tl.constexpr,
+    TOPK_HIST_FUSION: tl.constexpr,
+    TOPK_BIN_FUSION: tl.constexpr,
+    TOPK_TILE_SELECT: tl.constexpr,
+    TOPK_TILE_SELECT_CANDIDATES: tl.constexpr,
+    STORE_LOGITS: tl.constexpr,
+    FP8_LUT_DECODE: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    block_rk = tl.program_id(1)
+
+    batch_id = token_id // next_n
+    next_n_id = token_id % next_n
+
+    context_len = tl.load(context_lens_ptr + batch_id)
+    if block_rk * block_size >= context_len:
+        if TOPK_TILE_SELECT:
+            group_id = block_rk
+            for candidate_id in range(0, TOPK_TILE_SELECT_CANDIDATES):
+                candidate_col = (
+                    group_id * TOPK_TILE_SELECT_CANDIDATES + candidate_id
+                )
+                tl.store(
+                    topk_tile_logits_ptr
+                    + token_id * stride_tile_logits_t
+                    + candidate_col * stride_tile_logits_c,
+                    float("-inf"),
+                )
+                tl.store(
+                    topk_tile_indices_ptr
+                    + token_id * stride_tile_indices_t
+                    + candidate_col * stride_tile_indices_c,
+                    -1,
+                )
+            tl.store(
+                topk_tile_cutoffs_ptr
+                + token_id * stride_tile_cutoffs_t
+                + group_id * stride_tile_cutoffs_g,
+                float("-inf"),
+            )
+        return
+
+    q_offset = context_len - next_n + next_n_id
+
+    block_idx = tl.load(
+        block_tables_ptr + batch_id * stride_bt_b + block_rk * stride_bt_k
+    )
+
+    offs_h = tl.arange(0, BLOCK_H)
+    offs_d = tl.arange(0, BLOCK_D)
+    offs_n = tl.arange(0, BLOCK_N)
+    mask_h = offs_h < num_heads
+    mask_d = offs_d < head_dim
+    mask_n = offs_n < block_size
+
+    if Q_BF16:
+        q_base = q_ptr + token_id * stride_q_n
+        q = tl.load(
+            q_base
+            + offs_h[:, None] * stride_q_h
+            + offs_d[None, :] * stride_q_d,
+            mask=mask_h[:, None] & mask_d[None, :],
+            other=0.0,
+        ).to(tl.bfloat16)
+    else:
+        q_base = q_ptr + batch_id * stride_q_b + next_n_id * stride_q_n
+        q_byte = tl.load(
+            q_base
+            + offs_h[:, None] * stride_q_h
+            + offs_d[None, :] * stride_q_d,
+            mask=mask_h[:, None] & mask_d[None, :],
+            other=0,
+        )
+        if FP8_LUT_DECODE:
+            q = _decode_e4m3fn_lut(q_byte, fp8_lut_ptr).to(tl.bfloat16)
+        else:
+            q = _decode_e4m3fn(q_byte).to(tl.bfloat16)
+
+    kvf_base = kv_fp8_ptr + block_idx * stride_kvf_block
+    k_byte = tl.load(
+        kvf_base + offs_n[:, None] * stride_kvf_s + offs_d[None, :] * stride_kvf_d,
+        mask=mask_n[:, None] & mask_d[None, :],
+        other=0,
+    )
+    kvs_base = kv_scale_ptr + block_idx * stride_kvs_block
+    k_scale = tl.load(
+        kvs_base + offs_n * stride_kvs_s,
+        mask=mask_n,
+        other=0.0,
+    )
+    # Scale in fp32 for precision, then cast to bf16 for the matmul.
+    if FP8_LUT_DECODE:
+        k_decoded = _decode_e4m3fn_lut(k_byte, fp8_lut_ptr)
+    else:
+        k_decoded = _decode_e4m3fn(k_byte)
+    k = (k_decoded * k_scale[:, None]).to(tl.bfloat16)
+
+    s = tl.dot(q, tl.trans(k))
+
+    w = tl.load(
+        weights_ptr + token_id * stride_w_t + offs_h * stride_w_h,
+        mask=mask_h,
+        other=0.0,
+    )
+    s = tl.where(s > 0, s, 0.0) * w[:, None]
+    out = tl.sum(s, axis=0)
+
+    k_offset = block_rk * block_size + offs_n
+    valid = mask_n & (k_offset < context_len) & (k_offset <= q_offset)
+    out = tl.where(valid, out, float("-inf"))
+
+    if TOPK_HIST_FUSION or TOPK_BIN_FUSION:
+        hist_bin = _topk_step0_hist_bin(out)
+
+    if TOPK_HIST_FUSION:
+        tl.atomic_add(
+            topk_hist_ptr + token_id * stride_hist_t + hist_bin,
+            1,
+            mask=valid,
+        )
+
+    if TOPK_BIN_FUSION:
+        tl.store(
+            topk_bins_ptr + token_id * stride_bins_t + k_offset,
+            hist_bin.to(tl.int16),
+            mask=valid,
+        )
+
+    if TOPK_TILE_SELECT:
+        select_vals = tl.where(valid, out, float("-inf"))
+        last_candidate = float("-inf")
+        group_id = block_rk
+        offs_candidate = tl.arange(0, BLOCK_N)
+        for candidate_id in range(0, TOPK_TILE_SELECT_CANDIDATES):
+            candidate_val, candidate_pos = tl.max(
+                select_vals,
+                axis=0,
+                return_indices=True,
+            )
+            candidate_idx = tl.max(
+                tl.where(offs_candidate == candidate_pos, k_offset, 0),
+                axis=0,
+            )
+            candidate_idx = tl.where(candidate_val == float("-inf"), -1, candidate_idx)
+            candidate_col = group_id * TOPK_TILE_SELECT_CANDIDATES + candidate_id
+            tl.store(
+                topk_tile_logits_ptr
+                + token_id * stride_tile_logits_t
+                + candidate_col * stride_tile_logits_c,
+                candidate_val,
+            )
+            tl.store(
+                topk_tile_indices_ptr
+                + token_id * stride_tile_indices_t
+                + candidate_col * stride_tile_indices_c,
+                candidate_idx,
+            )
+            select_vals = tl.where(
+                offs_candidate == candidate_pos,
+                float("-inf"),
+                select_vals,
+            )
+            last_candidate = candidate_val
+        tl.store(
+            topk_tile_cutoffs_ptr
+            + token_id * stride_tile_cutoffs_t
+            + group_id * stride_tile_cutoffs_g,
+            last_candidate,
+        )
+
+    if STORE_LOGITS:
+        tl.store(
+            logits_ptr + token_id * stride_l_t + k_offset * stride_l_n,
+            out,
+            mask=mask_n,
+        )
+
+
+@triton.jit
+def _fp8_paged_mqa_logits_multi_block_kernel(
+    q_ptr,
+    kv_fp8_ptr,
+    kv_scale_ptr,
+    weights_ptr,
+    context_lens_ptr,
+    block_tables_ptr,
+    logits_ptr,
+    topk_hist_ptr,
+    topk_bins_ptr,
+    topk_tile_logits_ptr,
+    topk_tile_indices_ptr,
+    topk_tile_cutoffs_ptr,
+    fp8_lut_ptr,
+    stride_q_b,
+    stride_q_n,
+    stride_q_h,
+    stride_q_d,
+    stride_kvf_block,
+    stride_kvf_s,
+    stride_kvf_d,
+    stride_kvs_block,
+    stride_kvs_s,
+    stride_w_t,
+    stride_w_h,
+    stride_bt_b,
+    stride_bt_k,
+    stride_l_t,
+    stride_l_n,
+    stride_hist_t,
+    stride_bins_t,
+    stride_tile_logits_t,
+    stride_tile_logits_c,
+    stride_tile_indices_t,
+    stride_tile_indices_c,
+    stride_tile_cutoffs_t,
+    stride_tile_cutoffs_g,
+    next_n: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    block_table_blocks: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_PAGES: tl.constexpr,
+    Q_BF16: tl.constexpr,
+    TOPK_HIST_FUSION: tl.constexpr,
+    TOPK_BIN_FUSION: tl.constexpr,
+    TOPK_TILE_SELECT: tl.constexpr,
+    TOPK_TILE_SELECT_CANDIDATES: tl.constexpr,
+    STORE_LOGITS: tl.constexpr,
+    FP8_LUT_DECODE: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    block_group = tl.program_id(1) * BLOCK_PAGES
+
+    batch_id = token_id // next_n
+    next_n_id = token_id % next_n
+
+    context_len = tl.load(context_lens_ptr + batch_id)
+    if block_group * block_size >= context_len:
+        if TOPK_TILE_SELECT:
+            group_id = tl.program_id(1)
+            for candidate_id in range(0, TOPK_TILE_SELECT_CANDIDATES):
+                candidate_col = (
+                    group_id * TOPK_TILE_SELECT_CANDIDATES + candidate_id
+                )
+                tl.store(
+                    topk_tile_logits_ptr
+                    + token_id * stride_tile_logits_t
+                    + candidate_col * stride_tile_logits_c,
+                    float("-inf"),
+                )
+                tl.store(
+                    topk_tile_indices_ptr
+                    + token_id * stride_tile_indices_t
+                    + candidate_col * stride_tile_indices_c,
+                    -1,
+                )
+            tl.store(
+                topk_tile_cutoffs_ptr
+                + token_id * stride_tile_cutoffs_t
+                + group_id * stride_tile_cutoffs_g,
+                float("-inf"),
+            )
+        return
+
+    q_offset = context_len - next_n + next_n_id
+
+    offs_h = tl.arange(0, BLOCK_H)
+    offs_d = tl.arange(0, BLOCK_D)
+    offs_n = tl.arange(0, BLOCK_N)
+    mask_h = offs_h < num_heads
+    mask_d = offs_d < head_dim
+
+    in_group_tokens = BLOCK_PAGES * block_size
+    mask_n = offs_n < in_group_tokens
+    page_in_group = offs_n // block_size
+    page_offset = offs_n - page_in_group * block_size
+    block_rk = block_group + page_in_group
+    mask_block = block_rk < block_table_blocks
+
+    block_idx = tl.load(
+        block_tables_ptr + batch_id * stride_bt_b + block_rk * stride_bt_k,
+        mask=mask_n & mask_block,
+        other=0,
+    )
+
+    if Q_BF16:
+        q_base = q_ptr + token_id * stride_q_n
+        q = tl.load(
+            q_base
+            + offs_h[:, None] * stride_q_h
+            + offs_d[None, :] * stride_q_d,
+            mask=mask_h[:, None] & mask_d[None, :],
+            other=0.0,
+        ).to(tl.bfloat16)
+    else:
+        q_base = q_ptr + batch_id * stride_q_b + next_n_id * stride_q_n
+        q_byte = tl.load(
+            q_base
+            + offs_h[:, None] * stride_q_h
+            + offs_d[None, :] * stride_q_d,
+            mask=mask_h[:, None] & mask_d[None, :],
+            other=0,
+        )
+        if FP8_LUT_DECODE:
+            q = _decode_e4m3fn_lut(q_byte, fp8_lut_ptr).to(tl.bfloat16)
+        else:
+            q = _decode_e4m3fn(q_byte).to(tl.bfloat16)
+
+    k_byte = tl.load(
+        kv_fp8_ptr
+        + block_idx[:, None] * stride_kvf_block
+        + page_offset[:, None] * stride_kvf_s
+        + offs_d[None, :] * stride_kvf_d,
+        mask=(mask_n & mask_block)[:, None] & mask_d[None, :],
+        other=0,
+    )
+    k_scale = tl.load(
+        kv_scale_ptr
+        + block_idx * stride_kvs_block
+        + page_offset * stride_kvs_s,
+        mask=mask_n & mask_block,
+        other=0.0,
+    )
+    if FP8_LUT_DECODE:
+        k_decoded = _decode_e4m3fn_lut(k_byte, fp8_lut_ptr)
+    else:
+        k_decoded = _decode_e4m3fn(k_byte)
+    k = (k_decoded * k_scale[:, None]).to(tl.bfloat16)
+
+    s = tl.dot(q, tl.trans(k))
+
+    w = tl.load(
+        weights_ptr + token_id * stride_w_t + offs_h * stride_w_h,
+        mask=mask_h,
+        other=0.0,
+    )
+    s = tl.where(s > 0, s, 0.0) * w[:, None]
+    out = tl.sum(s, axis=0)
+
+    k_offset = block_group * block_size + offs_n
+    valid = (
+        mask_n
+        & mask_block
+        & (k_offset < context_len)
+        & (k_offset <= q_offset)
+    )
+    out = tl.where(valid, out, float("-inf"))
+
+    if TOPK_HIST_FUSION or TOPK_BIN_FUSION:
+        hist_bin = _topk_step0_hist_bin(out)
+
+    if TOPK_HIST_FUSION:
+        tl.atomic_add(
+            topk_hist_ptr + token_id * stride_hist_t + hist_bin,
+            1,
+            mask=valid,
+        )
+
+    if TOPK_BIN_FUSION:
+        tl.store(
+            topk_bins_ptr + token_id * stride_bins_t + k_offset,
+            hist_bin.to(tl.int16),
+            mask=valid,
+        )
+
+    if TOPK_TILE_SELECT:
+        select_vals = tl.where(valid, out, float("-inf"))
+        last_candidate = float("-inf")
+        group_id = tl.program_id(1)
+        offs_candidate = tl.arange(0, BLOCK_N)
+        for candidate_id in range(0, TOPK_TILE_SELECT_CANDIDATES):
+            candidate_val, candidate_pos = tl.max(
+                select_vals,
+                axis=0,
+                return_indices=True,
+            )
+            candidate_idx = tl.max(
+                tl.where(offs_candidate == candidate_pos, k_offset, 0),
+                axis=0,
+            )
+            candidate_idx = tl.where(candidate_val == float("-inf"), -1, candidate_idx)
+            candidate_col = group_id * TOPK_TILE_SELECT_CANDIDATES + candidate_id
+            tl.store(
+                topk_tile_logits_ptr
+                + token_id * stride_tile_logits_t
+                + candidate_col * stride_tile_logits_c,
+                candidate_val,
+            )
+            tl.store(
+                topk_tile_indices_ptr
+                + token_id * stride_tile_indices_t
+                + candidate_col * stride_tile_indices_c,
+                candidate_idx,
+            )
+            select_vals = tl.where(
+                offs_candidate == candidate_pos,
+                float("-inf"),
+                select_vals,
+            )
+            last_candidate = candidate_val
+        tl.store(
+            topk_tile_cutoffs_ptr
+            + token_id * stride_tile_cutoffs_t
+            + group_id * stride_tile_cutoffs_g,
+            last_candidate,
+        )
+
+    if STORE_LOGITS:
+        tl.store(
+            logits_ptr + token_id * stride_l_t + k_offset * stride_l_n,
+            out,
+            mask=mask_n & mask_block,
+        )
+
+
+def fp8_paged_mqa_logits_triton(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+    logits_out: torch.Tensor | None = None,
+    q_bf16: torch.Tensor | None = None,
+    topk_histogram: torch.Tensor | None = None,
+    topk_bins: torch.Tensor | None = None,
+    topk_tile_candidate_logits: torch.Tensor | None = None,
+    topk_tile_candidate_indices: torch.Tensor | None = None,
+    topk_tile_candidate_cutoffs: torch.Tensor | None = None,
+    store_logits: bool = True,
+) -> torch.Tensor:
+    """Triton implementation of DeepGEMM's fp8_paged_mqa_logits.
+
+    Args:
+        q:             [B, next_n, H, D] fp8_e4m3fn
+        kv_cache:      [num_blocks, block_size, 1, D+4] uint8 (FP8 + fp32 scale)
+        weights:       [B*next_n, H] float32
+        context_lens:  [B] int32
+        block_tables:  [B, max_blocks] int32
+        topk_histogram: optional [B*next_n, 2048] int32 step-0 TopK histogram
+        topk_bins:      optional [B*next_n, max_model_len] int16 step-0 bins
+        topk_tile_candidate_logits:
+                       optional compact [B*next_n, tile_groups*candidates]
+                       float32 candidate logits
+        topk_tile_candidate_indices:
+                       optional compact [B*next_n, tile_groups*candidates]
+                       int32 global candidate indices
+        topk_tile_candidate_cutoffs:
+                       optional [B*next_n, tile_groups] float32 local cutoffs
+        store_logits: whether to write the full logits matrix. This must stay
+                      true for normal service paths because candidate TopK may
+                      need full logits for exact fallback.
+    Returns:
+        logits:        [B*next_n, max_model_len] float32
+    """
+    B, next_n, num_heads, head_dim = q.shape
+    _, block_size, one, d_plus_4 = kv_cache.shape
+    assert one == 1
+    assert d_plus_4 == head_dim + 4
+
+    # Cache layout: `indexer_k_quant_and_cache` (csrc/cache_kernels.cu) writes
+    # each block as [K region | scale region] — all `block_size * head_dim`
+    # fp8 K bytes first, then `block_size * 4` fp32 scale bytes. The
+    # `[NB, block_size, 1, head_dim+4]` shape is just a stride trick; bytes
+    # must be re-sliced flat. The kernel decodes FP8 from uint8 manually since
+    # SM80 Triton can't compile `tl.float8e4nv`.
+    num_blocks = kv_cache.shape[0]
+    kv_flat = kv_cache.view(num_blocks, -1)
+    k_end = block_size * head_dim
+    kv_byte = kv_flat[:, :k_end].as_strided(
+        (num_blocks, block_size, head_dim),
+        (kv_flat.stride(0), head_dim, 1),
+    )
+    kv_scale = kv_flat[:, k_end:].view(torch.float32)
+    use_q_bf16 = q_bf16 is not None
+    if use_q_bf16:
+        assert q_bf16 is not None
+        assert q_bf16.dtype == torch.bfloat16
+        assert q_bf16.device == q.device
+        assert q_bf16.shape[0] >= num_heads
+        assert q_bf16.shape[1] >= B * next_n
+        assert q_bf16.shape[2] >= head_dim
+        q_source = q_bf16
+        q_stride_b = 0
+        q_stride_n = q_bf16.stride(1)
+        q_stride_h = q_bf16.stride(0)
+        q_stride_d = q_bf16.stride(2)
+    else:
+        q_byte = q.view(torch.uint8)
+        q_source = q_byte
+        q_stride_b = q_byte.stride(0)
+        q_stride_n = q_byte.stride(1)
+        q_stride_h = q_byte.stride(2)
+        q_stride_d = q_byte.stride(3)
+
+    if logits_out is not None:
+        assert logits_out.dtype == torch.float32
+        assert logits_out.device == q.device
+        assert logits_out.shape[0] >= B * next_n
+        assert logits_out.shape[1] >= max_model_len
+        logits = logits_out[: B * next_n, :max_model_len]
+        if not _DECODE_EMPTY_LOGITS:
+            logits.fill_(float("-inf"))
+    elif _DECODE_EMPTY_LOGITS:
+        logits = torch.empty(
+            (B * next_n, max_model_len),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:
+        logits = torch.full(
+            (B * next_n, max_model_len),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
+
+    use_topk_histogram = topk_histogram is not None
+    if use_topk_histogram:
+        assert topk_histogram is not None
+        assert topk_histogram.dtype == torch.int32
+        assert topk_histogram.device == q.device
+        assert topk_histogram.dim() == 2
+        assert topk_histogram.shape[0] >= B * next_n
+        assert topk_histogram.shape[1] >= 2048
+        assert topk_histogram.is_contiguous()
+        topk_hist = topk_histogram[: B * next_n, :2048]
+        topk_hist_ptr = topk_hist
+        topk_hist_stride_t = topk_hist.stride(0)
+    else:
+        topk_hist_ptr = logits
+        topk_hist_stride_t = 0
+
+    use_topk_bins = topk_bins is not None
+    if use_topk_bins:
+        assert topk_bins is not None
+        assert topk_bins.dtype == torch.int16
+        assert topk_bins.device == q.device
+        assert topk_bins.dim() == 2
+        assert topk_bins.shape[0] >= B * next_n
+        assert topk_bins.shape[1] >= max_model_len
+        assert topk_bins.stride(1) == 1
+        topk_bin_view = topk_bins[: B * next_n, :max_model_len]
+        topk_bins_ptr = topk_bin_view
+        topk_bins_stride_t = topk_bin_view.stride(0)
+    else:
+        topk_bins_ptr = logits
+        topk_bins_stride_t = 0
+
+    use_topk_tile_select = (
+        topk_tile_candidate_logits is not None
+        or topk_tile_candidate_indices is not None
+        or topk_tile_candidate_cutoffs is not None
+    )
+    if use_topk_tile_select:
+        assert topk_tile_candidate_logits is not None
+        assert topk_tile_candidate_indices is not None
+        assert topk_tile_candidate_cutoffs is not None
+        assert topk_tile_candidate_logits.dtype == torch.float32
+        assert topk_tile_candidate_indices.dtype == torch.int32
+        assert topk_tile_candidate_cutoffs.dtype == torch.float32
+        assert topk_tile_candidate_logits.device == q.device
+        assert topk_tile_candidate_indices.device == q.device
+        assert topk_tile_candidate_cutoffs.device == q.device
+        assert topk_tile_candidate_logits.dim() == 2
+        assert topk_tile_candidate_indices.dim() == 2
+        assert topk_tile_candidate_cutoffs.dim() == 2
+        assert topk_tile_candidate_logits.shape[0] >= B * next_n
+        assert topk_tile_candidate_indices.shape[0] >= B * next_n
+        assert topk_tile_candidate_cutoffs.shape[0] >= B * next_n
+        assert topk_tile_candidate_logits.stride(1) == 1
+        assert topk_tile_candidate_indices.stride(1) == 1
+        assert topk_tile_candidate_cutoffs.stride(1) == 1
+        topk_tile_logits_ptr = topk_tile_candidate_logits[: B * next_n]
+        topk_tile_indices_ptr = topk_tile_candidate_indices[: B * next_n]
+        topk_tile_cutoffs_ptr = topk_tile_candidate_cutoffs[: B * next_n]
+        topk_tile_logits_stride_t = topk_tile_logits_ptr.stride(0)
+        topk_tile_logits_stride_c = topk_tile_logits_ptr.stride(1)
+        topk_tile_indices_stride_t = topk_tile_indices_ptr.stride(0)
+        topk_tile_indices_stride_c = topk_tile_indices_ptr.stride(1)
+        topk_tile_cutoffs_stride_t = topk_tile_cutoffs_ptr.stride(0)
+        topk_tile_cutoffs_stride_g = topk_tile_cutoffs_ptr.stride(1)
+    else:
+        topk_tile_logits_ptr = logits
+        topk_tile_indices_ptr = logits
+        topk_tile_cutoffs_ptr = logits
+        topk_tile_logits_stride_t = 0
+        topk_tile_logits_stride_c = 0
+        topk_tile_indices_stride_t = 0
+        topk_tile_indices_stride_c = 0
+        topk_tile_cutoffs_stride_t = 0
+        topk_tile_cutoffs_stride_g = 0
+    fp8_lut = _fp8_e4m3fn_lut(q.device) if _DECODE_FP8_LUT else logits
+
+    BLOCK_H = max(16, triton.next_power_of_2(num_heads))
+    BLOCK_D = triton.next_power_of_2(head_dim)
+    BLOCK_N = triton.next_power_of_2(block_size)
+
+    block_pages = _DECODE_LOGITS_BLOCK_PAGES
+    if block_pages not in (1, 2, 4, 8):
+        raise ValueError(
+            "VLLM_SPARSE_INDEXER_DECODE_LOGITS_BLOCK_PAGES must be one "
+            f"of 1, 2, 4, or 8, got {block_pages}"
+        )
+    tile_groups = triton.cdiv(block_tables.shape[1], block_pages)
+    if use_topk_tile_select:
+        required_candidates = tile_groups * _DECODE_TOPK_TILE_SELECT_CANDIDATES
+        assert topk_tile_candidate_logits is not None
+        assert topk_tile_candidate_indices is not None
+        assert topk_tile_candidate_cutoffs is not None
+        assert topk_tile_candidate_logits.shape[1] >= required_candidates
+        assert topk_tile_candidate_indices.shape[1] >= required_candidates
+        assert topk_tile_candidate_cutoffs.shape[1] >= tile_groups
+    if block_pages > 1 or use_topk_histogram:
+        multi_block_n = triton.next_power_of_2(block_size * block_pages)
+        grid = (B * next_n, tile_groups)
+        _fp8_paged_mqa_logits_multi_block_kernel[grid](
+            q_source,
+            kv_byte,
+            kv_scale,
+            weights,
+            context_lens,
+            block_tables,
+            logits,
+            topk_hist_ptr,
+            topk_bins_ptr,
+            topk_tile_logits_ptr,
+            topk_tile_indices_ptr,
+            topk_tile_cutoffs_ptr,
+            fp8_lut,
+            q_stride_b,
+            q_stride_n,
+            q_stride_h,
+            q_stride_d,
+            kv_byte.stride(0),
+            kv_byte.stride(1),
+            kv_byte.stride(2),
+            kv_scale.stride(0),
+            kv_scale.stride(1),
+            weights.stride(0),
+            weights.stride(1),
+            block_tables.stride(0),
+            block_tables.stride(1),
+            logits.stride(0),
+            logits.stride(1),
+            topk_hist_stride_t,
+            topk_bins_stride_t,
+            topk_tile_logits_stride_t,
+            topk_tile_logits_stride_c,
+            topk_tile_indices_stride_t,
+            topk_tile_indices_stride_c,
+            topk_tile_cutoffs_stride_t,
+            topk_tile_cutoffs_stride_g,
+            next_n=next_n,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+            block_table_blocks=block_tables.shape[1],
+            BLOCK_H=BLOCK_H,
+            BLOCK_D=BLOCK_D,
+            BLOCK_N=multi_block_n,
+            BLOCK_PAGES=block_pages,
+            Q_BF16=use_q_bf16,
+            TOPK_HIST_FUSION=use_topk_histogram,
+            TOPK_BIN_FUSION=use_topk_bins,
+            TOPK_TILE_SELECT=use_topk_tile_select,
+            TOPK_TILE_SELECT_CANDIDATES=_DECODE_TOPK_TILE_SELECT_CANDIDATES,
+            STORE_LOGITS=store_logits,
+            FP8_LUT_DECODE=_DECODE_FP8_LUT,
+            num_warps=_DECODE_LOGITS_BLOCK_PAGES_WARPS,
+            num_stages=_DECODE_LOGITS_BLOCK_PAGES_STAGES,
+        )
+        return logits
+
+    grid = (B * next_n, block_tables.shape[1])
+    _fp8_paged_mqa_logits_kernel[grid](
+        q_source,
+        kv_byte,
+        kv_scale,
+        weights,
+        context_lens,
+        block_tables,
+        logits,
+        topk_hist_ptr,
+        topk_bins_ptr,
+        topk_tile_logits_ptr,
+        topk_tile_indices_ptr,
+        topk_tile_cutoffs_ptr,
+        fp8_lut,
+        q_stride_b,
+        q_stride_n,
+        q_stride_h,
+        q_stride_d,
+        kv_byte.stride(0),
+        kv_byte.stride(1),
+        kv_byte.stride(2),
+        kv_scale.stride(0),
+        kv_scale.stride(1),
+        weights.stride(0),
+        weights.stride(1),
+        block_tables.stride(0),
+        block_tables.stride(1),
+        logits.stride(0),
+        logits.stride(1),
+        topk_hist_stride_t,
+        topk_bins_stride_t,
+        topk_tile_logits_stride_t,
+        topk_tile_logits_stride_c,
+        topk_tile_indices_stride_t,
+        topk_tile_indices_stride_c,
+        topk_tile_cutoffs_stride_t,
+        topk_tile_cutoffs_stride_g,
+        next_n=next_n,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        block_size=block_size,
+        BLOCK_H=BLOCK_H,
+        BLOCK_D=BLOCK_D,
+        BLOCK_N=BLOCK_N,
+        Q_BF16=use_q_bf16,
+        TOPK_HIST_FUSION=use_topk_histogram,
+        TOPK_BIN_FUSION=use_topk_bins,
+        TOPK_TILE_SELECT=use_topk_tile_select,
+        TOPK_TILE_SELECT_CANDIDATES=_DECODE_TOPK_TILE_SELECT_CANDIDATES,
+        STORE_LOGITS=store_logits,
+        FP8_LUT_DECODE=_DECODE_FP8_LUT,
+    )
+    return logits
+
+
+@triton.autotune(
+    configs=_PREFILL_AUTOTUNE_CONFIGS,
+    # Per-program work doesn't depend on N — only the grid extent does — so
+    # a single autotune config is valid across seq lengths. Keeping N in the
+    # key used to re-tune from scratch on every new chunk size (e.g., 2048,
+    # 4096, 6144, 8192, 9993 for a 10K prompt with chunked prefill),
+    # producing ~2 minutes of first-call TTFT on top of the real work.
+    key=["num_heads", "head_dim"],
+)
+@triton.jit
+def _fp8_mqa_logits_kernel(
+    q_ptr,
+    k_ptr,
+    k_scale_ptr,
+    weights_ptr,
+    ks_ptr,
+    ke_ptr,
+    logits_ptr,
+    stride_q_m,
+    stride_q_h,
+    stride_q_d,
+    stride_k_n,
+    stride_k_d,
+    stride_w_m,
+    stride_w_h,
+    stride_l_m,
+    stride_l_n,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    m = tl.program_id(0)
+    n_block = tl.program_id(1)
+
+    n_start = n_block * BLOCK_N
+    offs_n = n_start + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+
+    offs_h = tl.arange(0, BLOCK_H)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_h = offs_h < num_heads
+    mask_d = offs_d < head_dim
+
+    q_byte = tl.load(
+        q_ptr
+        + m * stride_q_m
+        + offs_h[:, None] * stride_q_h
+        + offs_d[None, :] * stride_q_d,
+        mask=mask_h[:, None] & mask_d[None, :],
+        other=0,
+    )
+    q = _decode_e4m3fn(q_byte).to(tl.bfloat16)
+
+    k_byte = tl.load(
+        k_ptr + offs_n[:, None] * stride_k_n + offs_d[None, :] * stride_k_d,
+        mask=mask_n[:, None] & mask_d[None, :],
+        other=0,
+    )
+    k_scale = tl.load(k_scale_ptr + offs_n, mask=mask_n, other=0.0)
+    # Scale in fp32 for precision, then cast to bf16 for the matmul.
+    k = (_decode_e4m3fn(k_byte) * k_scale[:, None]).to(tl.bfloat16)
+
+    s = tl.dot(q, tl.trans(k))
+
+    w = tl.load(
+        weights_ptr + m * stride_w_m + offs_h * stride_w_h,
+        mask=mask_h,
+        other=0.0,
+    )
+    s = tl.where(s > 0, s, 0.0) * w[:, None]
+    out = tl.sum(s, axis=0)
+
+    ks = tl.load(ks_ptr + m)
+    ke = tl.load(ke_ptr + m)
+    valid = mask_n & (offs_n >= ks) & (offs_n < ke)
+    out = tl.where(valid, out, float("-inf"))
+
+    tl.store(
+        logits_ptr + m * stride_l_m + offs_n * stride_l_n,
+        out,
+        mask=mask_n,
+    )
+
+
+def fp8_mqa_logits_triton(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    """Triton implementation of DeepGEMM's fp8_mqa_logits.
+
+    Args:
+        q:            [M, H, D] fp8_e4m3fn
+        kv:           (k_fp8 [N, D], k_scales [N]) — fp8_e4m3fn, float32
+        weights:      [M, H] float32
+        cu_seqlen_ks: [M] int32
+        cu_seqlen_ke: [M] int32
+    Returns:
+        logits:       [M, N] float32
+    """
+    k_fp8, k_scales = kv
+    k_scales = k_scales.reshape(-1)
+
+    M, num_heads, head_dim = q.shape
+    N = k_fp8.shape[0]
+
+    logits = torch.full(
+        (M, N),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    BLOCK_H = max(16, triton.next_power_of_2(num_heads))
+    BLOCK_D = triton.next_power_of_2(head_dim)
+
+    # Pass FP8 tensors as uint8 — kernel decodes E4M3FN bytes manually so it
+    # works on SM80 where Triton can't compile the native fp8e4nv dtype.
+    q_byte = q.view(torch.uint8)
+    k_byte = k_fp8.view(torch.uint8)
+
+    # Grid depends on the autotuned BLOCK_N.
+    grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa: E731
+    _fp8_mqa_logits_kernel[grid](
+        q_byte,
+        k_byte,
+        k_scales,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        logits,
+        q_byte.stride(0),
+        q_byte.stride(1),
+        q_byte.stride(2),
+        k_byte.stride(0),
+        k_byte.stride(1),
+        weights.stride(0),
+        weights.stride(1),
+        logits.stride(0),
+        logits.stride(1),
+        num_heads=num_heads,
+        head_dim=head_dim,
+        N=N,
+        BLOCK_H=BLOCK_H,
+        BLOCK_D=BLOCK_D,
+    )
+    return logits
+
+
+def fp8_mqa_logits_cuda(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    fallback: bool = True,
+) -> torch.Tensor:
+    """CUDA/cuBLAS v4 replacement for the prefill fp8 MQA logits path.
+
+    The tensor contract matches :func:`fp8_mqa_logits_triton`. If the compiled
+    CUDA op is unavailable or raises and ``fallback`` is true, the original
+    Triton implementation is used.
+    """
+    return _fp8_mqa_logits_cuda_op(
+        "fp8_mqa_logits_cuda",
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        fallback=fallback,
+    )
+
+
+def fp8_mqa_logits_cuda_v5(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    fallback: bool = True,
+) -> torch.Tensor:
+    """Grouped CUDA/cuBLAS v5 replacement for the prefill fp8 MQA logits path."""
+    return _fp8_mqa_logits_cuda_op(
+        "fp8_mqa_logits_cuda_v5",
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        fallback=fallback,
+    )
+
+
+def fp8_mqa_logits_cuda_v7(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    fallback: bool = True,
+) -> torch.Tensor:
+    """Grouped CUDA/cuBLAS v7 path with an optional 8-head accumulation group."""
+    return _fp8_mqa_logits_cuda_op(
+        "fp8_mqa_logits_cuda_v7",
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        fallback=fallback,
+    )
+
+
+def fp8_mqa_dequant_k_cuda(
+    k_fp8: torch.Tensor,
+    k_scales: torch.Tensor,
+    k_bf16: torch.Tensor,
+) -> None:
+    """Dequantize FP8 MQA K cache rows into a reusable BF16 buffer."""
+    from vllm import _custom_ops as _custom_ops  # noqa: F401
+
+    torch.ops._C.fp8_mqa_dequant_k_cuda(
+        k_fp8,
+        k_scales.reshape(-1),
+        k_bf16,
+    )
+
+
+def fp8_mqa_dequant_q_cuda(
+    q_fp8: torch.Tensor,
+    q_bf16: torch.Tensor,
+) -> None:
+    """Dequantize FP8 MQA Q into reusable head-major BF16 [H, M, D]."""
+    from vllm import _custom_ops as _custom_ops  # noqa: F401
+
+    torch.ops._C.fp8_mqa_dequant_q_cuda(
+        q_fp8,
+        q_bf16,
+    )
+
+
+@triton.jit
+def _mqa_bf16_fused_logits_kernel(
+    q_ptr,
+    k_ptr,
+    w_ptr,
+    ks_ptr,
+    ke_ptr,
+    out_ptr,
+    stride_q_h,
+    stride_q_m,
+    stride_k_n,
+    stride_w_m,
+    stride_out_m,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    ROW_START_ZERO: tl.constexpr,
+    ROW_END_CONTIGUOUS: tl.constexpr,
+    ROW_END_BASE: tl.constexpr,
+    FAST_FULL_TILE: tl.constexpr,
+    FAST_INVALID_TILE: tl.constexpr,
+    SKIP_INVALID_STORE: tl.constexpr,
+    REUSE_K_TILE: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    mask_d = offs_d < D
+
+    if FAST_INVALID_TILE and ROW_START_ZERO and ROW_END_CONTIGUOUS:
+        block_n_start = pid_n * BLOCK_N
+        max_row_end = (
+            ROW_END_BASE + tl.minimum((pid_m + 1) * BLOCK_M, M) - 1
+        )
+        if block_n_start >= max_row_end:
+            if not SKIP_INVALID_STORE:
+                tl.store(
+                    out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :],
+                    float("-inf"),
+                    mask=mask_m[:, None] & mask_n[None, :],
+                )
+            return
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    if REUSE_K_TILE:
+        k_reuse = tl.load(
+            k_ptr + offs_n[:, None] * stride_k_n + offs_d[None, :],
+            mask=mask_n[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+    for h in tl.static_range(0, H):
+        q = tl.load(
+            q_ptr
+            + h * stride_q_h
+            + offs_m[:, None] * stride_q_m
+            + offs_d[None, :],
+            mask=mask_m[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        if REUSE_K_TILE:
+            k = k_reuse
+        else:
+            k = tl.load(
+                k_ptr + offs_n[:, None] * stride_k_n + offs_d[None, :],
+                mask=mask_n[:, None] & mask_d[None, :],
+                other=0.0,
+            )
+        s = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
+        weight = tl.load(
+            w_ptr + offs_m * stride_w_m + h,
+            mask=mask_m,
+            other=0.0,
+        )
+        acc += tl.maximum(s, 0.0) * weight[:, None]
+
+    if FAST_FULL_TILE and ROW_START_ZERO and ROW_END_CONTIGUOUS:
+        block_n_end = (pid_n + 1) * BLOCK_N
+        block_min_row_end = ROW_END_BASE + pid_m * BLOCK_M
+        if block_n_end <= block_min_row_end:
+            tl.store(
+                out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :],
+                acc,
+                mask=mask_m[:, None] & mask_n[None, :],
+            )
+            return
+
+    if ROW_END_CONTIGUOUS:
+        row_end = ROW_END_BASE + offs_m
+    else:
+        row_end = tl.load(ke_ptr + offs_m, mask=mask_m, other=0)
+    if ROW_START_ZERO:
+        valid = mask_m[:, None] & mask_n[None, :] & (
+            offs_n[None, :] < row_end[:, None]
+        )
+    else:
+        row_start = tl.load(ks_ptr + offs_m, mask=mask_m, other=0)
+        valid = (
+            mask_m[:, None]
+            & mask_n[None, :]
+            & (offs_n[None, :] >= row_start[:, None])
+            & (offs_n[None, :] < row_end[:, None])
+        )
+    acc = tl.where(valid, acc, float("-inf"))
+    tl.store(
+        out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :],
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+def fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
+    q_bf16: torch.Tensor,
+    k_bf16: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    actual_n: int | None = None,
+    logits_out: torch.Tensor | None = None,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    row_start_zero: bool = False,
+    row_end_base: int | None = None,
+) -> torch.Tensor:
+    """Exact fused Triton logits path for pre-dequantized BF16 Q and K."""
+    M = q_bf16.shape[1]
+    N = k_bf16.shape[0] if actual_n is None else actual_n
+    if logits_out is None:
+        logits = torch.empty((M, N), dtype=torch.float32, device=q_bf16.device)
+    else:
+        logits = logits_out[:M, :N]
+        if logits.shape != (M, N):
+            raise RuntimeError(
+                f"logits_out is too small for M={M}, N={N}: {logits_out.shape}"
+            )
+    if M == 0 or N == 0:
+        return logits
+
+    if not q_bf16.is_cuda:
+        raise RuntimeError("q_bf16 is not a CUDA tensor")
+    if q_bf16.dtype != torch.bfloat16 or k_bf16.dtype != torch.bfloat16:
+        raise RuntimeError(
+            "fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton requires CUDA bf16 q/k"
+        )
+
+    block_m = block_m or int(
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_BLOCK_M", "16")
+    )
+    block_n = block_n or int(
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_BLOCK_N", "128")
+    )
+    fast_full_tile = (
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_FAST_FULL_TILE", "0") == "1"
+    )
+    fast_invalid_tile = (
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_FAST_INVALID_TILE", "0") == "1"
+    )
+    skip_invalid_store = (
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_SKIP_INVALID_STORE", "0") == "1"
+    )
+    reuse_k_tile = (
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_REUSE_K_TILE", "0") == "1"
+    )
+    num_warps = int(
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_NUM_WARPS", "4")
+    )
+    num_stages = int(
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_NUM_STAGES", "3")
+    )
+    decode_m_max_env = os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_M_MAX")
+    decode_m_max = int(decode_m_max_env) if decode_m_max_env else 0
+    if decode_m_max > 0 and M <= decode_m_max:
+        decode_block_m = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_BLOCK_M"
+        )
+        if decode_block_m:
+            block_m = int(decode_block_m)
+        decode_block_n = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_BLOCK_N"
+        )
+        if decode_block_n:
+            block_n = int(decode_block_n)
+        decode_num_stages = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_NUM_STAGES"
+        )
+        if decode_num_stages:
+            num_stages = int(decode_num_stages)
+        decode_num_warps = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_DECODE_NUM_WARPS"
+        )
+        if decode_num_warps:
+            num_warps = int(decode_num_warps)
+    small_n_max = int(
+        os.getenv("VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_MAX", "0")
+    )
+    if small_n_max > 0 and N <= small_n_max:
+        small_block_m = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_BLOCK_M"
+        )
+        if small_block_m is not None:
+            block_m = int(small_block_m)
+        small_block_n = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_BLOCK_N"
+        )
+        if small_block_n is not None:
+            block_n = int(small_block_n)
+        small_skip_invalid_store = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_SKIP_INVALID_STORE"
+        )
+        if small_skip_invalid_store is not None:
+            skip_invalid_store = small_skip_invalid_store == "1"
+        small_fast_full_tile = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_FAST_FULL_TILE"
+        )
+        if small_fast_full_tile is not None:
+            fast_full_tile = small_fast_full_tile == "1"
+        small_num_stages = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_NUM_STAGES"
+        )
+        if small_num_stages is not None:
+            num_stages = int(small_num_stages)
+        small_num_warps = os.getenv(
+            "VLLM_MQA_CUDA_V7_FUSED_TRITON_SMALL_N_NUM_WARPS"
+        )
+        if small_num_warps is not None:
+            num_warps = int(small_num_warps)
+    H, _, D = q_bf16.shape
+    grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
+    _mqa_bf16_fused_logits_kernel[grid](
+        q_bf16,
+        k_bf16,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        logits,
+        q_bf16.stride(0),
+        q_bf16.stride(1),
+        k_bf16.stride(0),
+        weights.stride(0),
+        logits.stride(0),
+        M=M,
+        N=N,
+        H=H,
+        D=D,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_D=triton.next_power_of_2(D),
+        ROW_START_ZERO=row_start_zero,
+        ROW_END_CONTIGUOUS=row_end_base is not None,
+        ROW_END_BASE=0 if row_end_base is None else row_end_base,
+        FAST_FULL_TILE=fast_full_tile,
+        FAST_INVALID_TILE=fast_invalid_tile,
+        SKIP_INVALID_STORE=skip_invalid_store,
+        REUSE_K_TILE=reuse_k_tile,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return logits
+
+
+def fp8_mqa_logits_cuda_v7_fused_triton(
+    q: torch.Tensor,
+    k_bf16: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    actual_n: int | None = None,
+    q_bf16_out: torch.Tensor | None = None,
+    logits_out: torch.Tensor | None = None,
+    row_start_zero: bool = False,
+    row_end_base: int | None = None,
+    fallback: bool = True,
+) -> torch.Tensor:
+    """Exact fused Triton logits path that reuses a pre-dequantized BF16 K."""
+    try:
+        if not q.is_cuda:
+            raise RuntimeError("q is not a CUDA tensor")
+        if q.dtype != torch.float8_e4m3fn or k_bf16.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "fp8_mqa_logits_cuda_v7_fused_triton requires CUDA fp8 q and "
+                "bf16 k"
+            )
+        M, H, D = q.shape
+        if q_bf16_out is None:
+            q_bf16 = torch.empty((H, M, D), dtype=torch.bfloat16, device=q.device)
+        else:
+            q_bf16 = q_bf16_out[:, :M, :]
+            if q_bf16.shape != (H, M, D):
+                raise RuntimeError(
+                    f"q_bf16_out is too small for H={H}, M={M}, D={D}: "
+                    f"{q_bf16_out.shape}"
+                )
+        fp8_mqa_dequant_q_cuda(q, q_bf16)
+        return fp8_mqa_logits_cuda_v7_bf16_qk_fused_triton(
+            q_bf16,
+            k_bf16,
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            actual_n=actual_n,
+            logits_out=logits_out,
+            row_start_zero=row_start_zero,
+            row_end_base=row_end_base,
+        )
+    except Exception as err:
+        if not fallback:
+            raise
+        logger.warning_once(
+            "fp8_mqa_logits_cuda_v7_fused_triton failed; falling back to "
+            "CUDA/cuBLAS bf16-k: %s",
+            err,
+        )
+        return fp8_mqa_logits_cuda_v7_bf16_k(
+            q,
+            k_bf16,
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            actual_n=actual_n,
+            logits_out=logits_out,
+            fallback=fallback,
+        )
+
+
+def fp8_mqa_logits_cuda_v7_bf16_k(
+    q: torch.Tensor,
+    k_bf16: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    actual_n: int | None = None,
+    logits_out: torch.Tensor | None = None,
+    fallback: bool = True,
+) -> torch.Tensor:
+    """v7 MQA logits path that reuses a pre-dequantized BF16 K buffer."""
+    M = q.shape[0]
+    actual_N = k_bf16.shape[0] if actual_n is None else actual_n
+    N = actual_N
+    pad_n = (
+        os.getenv("VLLM_MQA_CUDA_V7_PAD_N", "0") == "1"
+        and N >= 32768
+        and N % 128 != 0
+    )
+    if pad_n:
+        padded_N = ((N + 127) // 128) * 128
+        if k_bf16.shape[0] >= padded_N:
+            N = padded_N
+        else:
+            pad_n = False
+    if logits_out is None:
+        logits = torch.empty(
+            (M, N),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:
+        logits = logits_out[:M, :N]
+        if logits.shape != (M, N):
+            raise RuntimeError(
+                f"logits_out is too small for M={M}, N={N}: {logits_out.shape}"
+            )
+
+    try:
+        if not q.is_cuda:
+            raise RuntimeError("q is not a CUDA tensor")
+        if q.dtype != torch.float8_e4m3fn or k_bf16.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "fp8_mqa_logits_cuda_v7_bf16_k requires CUDA fp8 q and bf16 k"
+            )
+        from vllm import _custom_ops as _custom_ops  # noqa: F401
+
+        torch.ops._C.fp8_mqa_logits_cuda_v7_bf16_k(
+            q,
+            k_bf16[:N],
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            logits,
+        )
+        if pad_n:
+            return logits[:, :actual_N]
+        return logits
+    except Exception as err:
+        if not fallback:
+            raise
+        raise RuntimeError(
+            "fp8_mqa_logits_cuda_v7_bf16_k has no lossless fallback without "
+            "the original FP8 K/scales"
+        ) from err
+
+
+def fp8_mqa_logits_cuda_v7_bf16_qk(
+    q_bf16: torch.Tensor,
+    k_bf16: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    actual_n: int | None = None,
+    logits_out: torch.Tensor | None = None,
+    fallback: bool = True,
+) -> torch.Tensor:
+    """v7 MQA logits path that reuses pre-dequantized BF16 Q and K buffers."""
+    M = q_bf16.shape[1]
+    actual_N = k_bf16.shape[0] if actual_n is None else actual_n
+    N = actual_N
+    pad_n = (
+        os.getenv("VLLM_MQA_CUDA_V7_PAD_N", "0") == "1"
+        and N >= 32768
+        and N % 128 != 0
+    )
+    if pad_n:
+        padded_N = ((N + 127) // 128) * 128
+        if k_bf16.shape[0] >= padded_N:
+            N = padded_N
+        else:
+            pad_n = False
+    if logits_out is None:
+        logits = torch.empty((M, N), dtype=torch.float32, device=q_bf16.device)
+    else:
+        logits = logits_out[:M, :N]
+        if logits.shape != (M, N):
+            raise RuntimeError(
+                f"logits_out is too small for M={M}, N={N}: {logits_out.shape}"
+            )
+
+    try:
+        if not q_bf16.is_cuda:
+            raise RuntimeError("q_bf16 is not a CUDA tensor")
+        if q_bf16.dtype != torch.bfloat16 or k_bf16.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "fp8_mqa_logits_cuda_v7_bf16_qk requires CUDA bf16 q/k"
+            )
+        from vllm import _custom_ops as _custom_ops  # noqa: F401
+
+        torch.ops._C.fp8_mqa_logits_cuda_v7_bf16_qk(
+            q_bf16,
+            k_bf16[:N],
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            logits,
+        )
+        if pad_n:
+            return logits[:, :actual_N]
+        return logits
+    except Exception as err:
+        if not fallback:
+            raise
+        raise RuntimeError(
+            "fp8_mqa_logits_cuda_v7_bf16_qk has no lossless fallback without "
+            "the original FP8 Q/K/scales"
+        ) from err
+
+
+def _fp8_mqa_logits_cuda_op(
+    op_name: str,
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    fallback: bool,
+) -> torch.Tensor:
+    k_fp8, k_scales = kv
+    k_scales = k_scales.reshape(-1)
+
+    M = q.shape[0]
+    N = k_fp8.shape[0]
+    actual_N = N
+    pad_n = (
+        op_name == "fp8_mqa_logits_cuda_v7"
+        and os.getenv("VLLM_MQA_CUDA_V7_PAD_N", "0") == "1"
+        and N >= 32768
+        and N % 128 != 0
+    )
+    if pad_n:
+        padded_N = ((N + 127) // 128) * 128
+        N = padded_N
+    logits = torch.empty(
+        (M, N),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    try:
+        if not q.is_cuda:
+            raise RuntimeError("q is not a CUDA tensor")
+        if q.dtype != torch.float8_e4m3fn or k_fp8.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                "fp8_mqa_logits_cuda requires CUDA float8_e4m3fn q/k tensors"
+            )
+        # Importing _custom_ops loads the _C extension for direct test usage,
+        # where sparse_attn_indexer.py may not have imported it yet.
+        from vllm import _custom_ops as _custom_ops  # noqa: F401
+
+        if not hasattr(torch.ops, "_C") or not hasattr(torch.ops._C, op_name):
+            raise RuntimeError(f"torch.ops._C.{op_name} is unavailable")
+        getattr(torch.ops._C, op_name)(
+            q,
+            k_fp8,
+            k_scales,
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            logits,
+        )
+        if pad_n:
+            return logits[:, :actual_N]
+        return logits
+    except Exception as err:
+        if not fallback:
+            raise
+        logger.warning_once(
+            "%s failed; falling back to Triton: %s", op_name, err
+        )
+        return fp8_mqa_logits_triton(
+            q, (k_fp8, k_scales), weights, cu_seqlen_ks, cu_seqlen_ke
+        )
+
+
+def warmup_fp8_mqa_logits_triton(
+    num_heads: int,
+    head_dim: int,
+    device: torch.device,
+) -> None:
+    """Prime the prefill `@triton.autotune` cache for the indexer's logits
+    kernel. Runs one shape matching the autotune key so that the first real
+    request does not pay the inline sweep + JIT cost (~5–8 s on A100 SM80).
+
+    N is not in the autotune key (removed so chunked-prefill doesn't re-tune
+    at every chunk size), so a single dummy N is enough. Pick N large enough
+    to exercise every BLOCK_N config in `_PREFILL_AUTOTUNE_CONFIGS`.
+    """
+    max_block_n = max(c.kwargs["BLOCK_N"] for c in _PREFILL_AUTOTUNE_CONFIGS)
+    n = max_block_n
+    q = torch.empty(1, num_heads, head_dim, dtype=torch.float8_e4m3fn, device=device)
+    k = torch.empty(n, head_dim, dtype=torch.float8_e4m3fn, device=device)
+    scales = torch.zeros(n, dtype=torch.float32, device=device)
+    weights = torch.zeros(1, num_heads, dtype=torch.float32, device=device)
+    ks = torch.zeros(1, dtype=torch.int32, device=device)
+    ke = torch.full((1,), n, dtype=torch.int32, device=device)
+    fp8_mqa_logits_triton(q, (k, scales), weights, ks, ke)
+
+
+def warmup_fp8_paged_mqa_logits_triton(
+    num_heads: int,
+    head_dim: int,
+    block_size: int,
+    device: torch.device,
+) -> None:
+    """Prime the paged-decode `@triton.autotune` cache for the indexer's
+    logits kernel (see `warmup_fp8_mqa_logits_triton` for rationale).
+    """
+    num_blocks = 2
+    q = torch.empty(1, 1, num_heads, head_dim, dtype=torch.float8_e4m3fn, device=device)
+    kv_cache = torch.zeros(
+        num_blocks, block_size, 1, head_dim + 4, dtype=torch.uint8, device=device
+    )
+    weights = torch.zeros(1, num_heads, dtype=torch.float32, device=device)
+    context_lens = torch.tensor([block_size], dtype=torch.int32, device=device)
+    block_tables = torch.zeros(1, 1, dtype=torch.int32, device=device)
+    fp8_paged_mqa_logits_triton(
+        q, kv_cache, weights, context_lens, block_tables, max_model_len=block_size
+    )

@@ -1,0 +1,78 @@
+{
+  "format_version": 2,
+  "recorded_at_utc": "2026-07-24",
+  "source": {
+    "reported_vllm_line": "custom v0.19.0",
+    "original_commit": "bfd727e11b0e501bab0a4a943d92ba5ea3b2f980",
+    "original_tree": "9b1b1bf2a2f20459a1de4c0dc2ba73f23f6c2923",
+    "runtime_patch_commit": "a5a2ddfc3fb1b221a6eb41023b254ac54a98bd2c",
+    "runtime_patch_tree": "9827b512682b62487fadb44a1f247b36d8852410",
+    "baseline_build_commit": "fd3e0b3772e989cf0d0d73a3d19b252ab82e9cdd",
+    "baseline_build_tree": "31faa41bfb082983fa853dc1c499b48db3a81d3d"
+  },
+  "verified_image": {
+    "tag": "192.168.14.129:80/ae/vllm_openai_glm52:v0.19.0-v2-stable-2p1d-usagefix-20260625_114616",
+    "id": "sha256:d6faf4d3a5f7f3800a745f8aea15884c881ea20b1100993d83ca8c4f985bd7a5",
+    "created_at_utc": "2026-06-25T11:45:17.732856156Z",
+    "archive_bytes": 34754212352,
+    "archive_sha256": "b58fc5cf7874da92f5a97306d47c9d7d507332515a73e6812a7eb6145e9bed23",
+    "platform": "linux/amd64",
+    "cuda": "12.9.1",
+    "python": "3.12"
+  },
+  "python_packages": {
+    "torch": "2.11.0+cu129",
+    "triton": "3.6.0",
+    "vllm_dist_info": "0.11.2.dev278+gdbc3d9991",
+    "vllm_version_override": "0.11.2.dev278+v7tpotbench",
+    "transformers": "5.8.1",
+    "tokenizers": "0.22.2"
+  },
+  "candidate_image": {
+    "format": "OCI image layout",
+    "tag": "phase0-baseline",
+    "base_manifest_digest": "sha256:1b8e808e44e7ef50be0cc8ff874597c37e09a2a428f06092ab570e6079086415",
+    "manifest_digest": "sha256:2fdfbe865aecc01eee15a01fcce58bf7581244dbbc53cbe3ef0e0cce44bc489d",
+    "config_digest": "sha256:58a853ee730c263968dcc6b76401e85e4b510a140777c4ffc791747edd8ea42d",
+    "source_layer_digest": "sha256:352d47f649171770e32edb7e1112e8a31f6a5aead0f6160a30ad3a8eec6659c3",
+    "source_layer_diff_id": "sha256:e9287018ae318195cd2bdc8fdd88b5c6fd7f85c2c44db453d891c075f538ccf8",
+    "source_layer_bytes": 33253726,
+    "source_layer_tar_members": 5256,
+    "source_layer_files": 4711,
+    "base_layers_unchanged": "31/31"
+  },
+  "runtime_source_sha256_file": "recovery/runtime_source.sha256",
+  "native_extensions_sha256_file": "recovery/native_extensions.sha256",
+  "validation": {
+    "image_archive_sha256": "passed",
+    "runtime_source_match": "4/4",
+    "python_3_12_py_compile": "passed",
+    "git_diff_check": "passed",
+    "ruff_0_14_0": {
+      "status": "failed",
+      "existing_image_findings": [
+        "toy_proxy_server.py: 3 x E501",
+        "compiler_interface.py: 1 x SIM102"
+      ]
+    },
+    "candidate_image_rebuild": "passed",
+    "candidate_layer_reproducibility": {
+      "status": "passed",
+      "independent_builds": 2,
+      "digest_diff_id_and_size_identical": true
+    },
+    "candidate_source_layer_match": "4711/4711",
+    "native_extensions_preserved": {
+      "status": "passed",
+      "evidence": "31/31 base layer descriptors unchanged; source layer contains no .so or whiteout"
+    },
+    "full_rootfs_unpack": {
+      "status": "not_completed",
+      "reason": "terminated after approximately 72 minutes of NFS xattr/metadata processing",
+      "bytes_read_at_70_minute_checkpoint": 20377350144,
+      "bytes_written_at_70_minute_checkpoint": 35113099264,
+      "expanded_rootfs_runtime_source_sha256": "4/4",
+      "expanded_rootfs_native_extension_sha256": "7/7"
+    }
+  }
+}

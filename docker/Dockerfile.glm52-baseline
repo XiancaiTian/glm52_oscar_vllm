@@ -1,0 +1,20 @@
+ARG BASE_IMAGE=192.168.14.129:80/ae/vllm_openai_glm52:v0.19.0-v2-stable-2p1d-usagefix-20260625_114616
+FROM ${BASE_IMAGE}
+
+ARG RUNTIME_SOURCE_COMMIT=a5a2ddfc3fb1b221a6eb41023b254ac54a98bd2c
+
+LABEL org.opencontainers.image.title="GLM-5.2 A800 baseline recovery"
+LABEL org.opencontainers.image.revision="${RUNTIME_SOURCE_COMMIT}"
+LABEL ai.intellif.glm52.base-image-id="sha256:d6faf4d3a5f7f3800a745f8aea15884c881ea20b1100993d83ca8c4f985bd7a5"
+
+COPY . /opt/vllm_glm52_v1
+
+WORKDIR /opt/vllm_glm52_v1
+
+RUN sha256sum -c recovery/runtime_source.sha256 \
+    && sha256sum -c recovery/native_extensions.sha256
+
+ENV PYTHONPATH=/opt/vllm_glm52_v1
+
+ENTRYPOINT ["/bin/bash"]
+CMD ["-lc", "sleep infinity"]
