@@ -1,0 +1,217 @@
+"""PyTorch reference operations for shared-latent OSCAR MLA."""
+
+from dataclasses import dataclass
+
+import torch
+
+
+@dataclass(frozen=True)
+class Int2Quantized:
+    """Asymmetric INT2 values and their per-group metadata."""
+
+    data: torch.Tensor
+    scale: torch.Tensor
+    zero_point: torch.Tensor
+    clipped: torch.Tensor
+
+
+@dataclass(frozen=True)
+class MixedTokenPartition:
+    """Prefix, recent, and history token slices for one sequence."""
+
+    prefix: slice
+    recent: slice
+    history: slice
+    total_tokens: int
+
+
+def partition_mixed_tokens(
+    seq_len: int,
+    *,
+    prefix_tokens: int,
+    recent_tokens: int,
+) -> MixedTokenPartition:
+    """Partition a sequence into disjoint prefix, history, and recent tiers."""
+    if seq_len < 0:
+        raise ValueError(f"seq_len must be non-negative, got {seq_len}")
+    if prefix_tokens < 0 or recent_tokens < 0:
+        raise ValueError("prefix_tokens and recent_tokens must be non-negative")
+
+    prefix_end = min(seq_len, prefix_tokens)
+    recent_start = max(prefix_end, seq_len - recent_tokens)
+    return MixedTokenPartition(
+        prefix=slice(0, prefix_end),
+        history=slice(prefix_end, recent_start),
+        recent=slice(recent_start, seq_len),
+        total_tokens=seq_len,
+    )
+
+
+def quantize_int2(
+    values: torch.Tensor,
+    *,
+    group_size: int,
+    clip_ratio: float,
+    eps: float = 1e-8,
+) -> Int2Quantized:
+    """Clip and asymmetrically quantize the last dimension to unsigned INT2."""
+    if values.shape[-1] % group_size:
+        raise ValueError(
+            f"last dimension {values.shape[-1]} is not divisible by {group_size}"
+        )
+    if not 0 < clip_ratio <= 1:
+        raise ValueError(f"clip_ratio must be in (0, 1], got {clip_ratio}")
+    if eps <= 0:
+        raise ValueError(f"eps must be positive, got {eps}")
+
+    groups = values.reshape(*values.shape[:-1], -1, group_size)
+    clip_index = min(group_size - 1, int(clip_ratio * group_size))
+    threshold = groups.abs().sort(dim=-1).values[..., clip_index : clip_index + 1]
+    clipped_groups = groups.clamp(-threshold, threshold)
+    value_min = clipped_groups.amin(dim=-1, keepdim=True)
+    value_max = clipped_groups.amax(dim=-1, keepdim=True)
+    scale = (value_max - value_min).clamp(min=eps) / 3
+    zero_point = -value_min / scale
+    quantized = (
+        (clipped_groups / scale + zero_point + 0.5)
+        .to(torch.int32)
+        .clamp_(0, 3)
+        .to(torch.uint8)
+    )
+    return Int2Quantized(
+        data=quantized.reshape(values.shape),
+        scale=scale,
+        zero_point=zero_point,
+        clipped=clipped_groups.reshape(values.shape),
+    )
+
+
+def dequantize_int2(
+    data: torch.Tensor,
+    scale: torch.Tensor,
+    zero_point: torch.Tensor,
+    *,
+    group_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dequantize unsigned INT2 values using FP32 scale and zero point."""
+    if data.shape[-1] % group_size:
+        raise ValueError(
+            f"last dimension {data.shape[-1]} is not divisible by {group_size}"
+        )
+    groups = data.reshape(*data.shape[:-1], -1, group_size).float()
+    restored = (groups - zero_point.float()) * scale.float()
+    return restored.reshape(data.shape).to(dtype)
+
+
+def pack_int2(data: torch.Tensor) -> torch.Tensor:
+    """Pack four unsigned INT2 values into each byte, low bits first."""
+    if data.shape[-1] % 4:
+        raise ValueError(f"last dimension {data.shape[-1]} is not divisible by 4")
+    if data.dtype != torch.uint8:
+        raise TypeError(f"INT2 data must use uint8 storage, got {data.dtype}")
+    if data.numel() and bool(torch.any(data > 3)):
+        raise ValueError("INT2 data contains a value greater than 3")
+
+    values = data.reshape(*data.shape[:-1], -1, 4)
+    return (
+        values[..., 0]
+        | (values[..., 1] << 2)
+        | (values[..., 2] << 4)
+        | (values[..., 3] << 6)
+    )
+
+
+def unpack_int2(packed: torch.Tensor, *, original_dim: int) -> torch.Tensor:
+    """Unpack low-bit-first INT2 bytes and trim to the original dimension."""
+    if packed.dtype != torch.uint8:
+        raise TypeError(f"packed INT2 data must use uint8, got {packed.dtype}")
+    available = packed.shape[-1] * 4
+    if original_dim < 0 or original_dim > available:
+        raise ValueError(
+            f"original_dim must be in [0, {available}], got {original_dim}"
+        )
+    values = torch.stack(
+        tuple((packed >> shift) & 0x03 for shift in (0, 2, 4, 6)),
+        dim=-1,
+    ).flatten(start_dim=-2)
+    return values[..., :original_dim]
+
+
+def _attention_scale(query: torch.Tensor, scale: float | None) -> float:
+    return query.shape[-1] ** -0.5 if scale is None else scale
+
+
+def native_latent_attention(
+    query: torch.Tensor,
+    latent: torch.Tensor,
+    *,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Compute dense attention directly in the unrotated latent basis."""
+    logits = torch.einsum("...hd,sd->...hs", query, latent)
+    weights = torch.softmax(logits * _attention_scale(query, scale), dim=-1)
+    return torch.einsum("...hs,sd->...hd", weights, latent)
+
+
+def rotated_latent_attention(
+    query: torch.Tensor,
+    latent: torch.Tensor,
+    rotation: torch.Tensor,
+    *,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Compute latent attention in a shared rotated basis and invert output."""
+    query_rotated = query @ rotation
+    latent_rotated = latent @ rotation
+    output_rotated = native_latent_attention(
+        query_rotated,
+        latent_rotated,
+        scale=scale,
+    )
+    return output_rotated @ rotation.T
+
+
+def mixed_latent_attention(
+    query: torch.Tensor,
+    *,
+    prefix_latent: torch.Tensor,
+    recent_latent: torch.Tensor,
+    history_rotated: torch.Tensor,
+    rotation: torch.Tensor,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Compute one softmax across BF16 tiers and rotated history."""
+    query_rotated = query @ rotation
+    factor = _attention_scale(query, scale)
+    prefix_logits = torch.einsum("...hd,sd->...hs", query, prefix_latent)
+    history_logits = torch.einsum(
+        "...hd,sd->...hs",
+        query_rotated,
+        history_rotated,
+    )
+    recent_logits = torch.einsum("...hd,sd->...hs", query, recent_latent)
+    logits = torch.cat((prefix_logits, history_logits, recent_logits), dim=-1)
+    weights = torch.softmax(logits * factor, dim=-1)
+
+    prefix_end = prefix_latent.shape[0]
+    history_end = prefix_end + history_rotated.shape[0]
+    prefix_output = torch.einsum(
+        "...hs,sd->...hd",
+        weights[..., :prefix_end],
+        prefix_latent,
+    )
+    history_output = (
+        torch.einsum(
+            "...hs,sd->...hd",
+            weights[..., prefix_end:history_end],
+            history_rotated,
+        )
+        @ rotation.T
+    )
+    recent_output = torch.einsum(
+        "...hs,sd->...hd",
+        weights[..., history_end:],
+        recent_latent,
+    )
+    return prefix_output + history_output + recent_output
