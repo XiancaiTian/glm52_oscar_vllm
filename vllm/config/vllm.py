@@ -1152,6 +1152,9 @@ class VllmConfig:
             )
         current_platform.check_and_update_config(self)
 
+        if self.cache_config.cache_dtype == "oscar_mla_int2":
+            self._validate_oscar_mla_runtime()
+
         if envs.VLLM_USE_V2_MODEL_RUNNER:
             self._validate_v2_model_runner()
 
@@ -1836,6 +1839,26 @@ class VllmConfig:
             raise ValueError(
                 "VLLM_USE_V2_MODEL_RUNNER does not yet support: "
                 + ", ".join(unsupported)
+            )
+
+    def _validate_oscar_mla_runtime(self) -> None:
+        """Reject runtime modes not implemented by the first OSCAR MLA path."""
+        unsupported: list[str] = []
+        if envs.VLLM_USE_V2_MODEL_RUNNER:
+            unsupported.append("V2 model runner")
+        if self.model_config is None or not self.model_config.enforce_eager:
+            unsupported.append("non-eager execution")
+        if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            unsupported.append("CUDA graph")
+        if self.speculative_config is not None:
+            unsupported.append("speculative decoding")
+        if self.parallel_config.decode_context_parallel_size > 1:
+            unsupported.append("decode context parallelism")
+        if self.parallel_config.enable_dbo:
+            unsupported.append("dual batch overlap")
+        if unsupported:
+            raise ValueError(
+                "oscar_mla_int2 does not yet support: " + ", ".join(unsupported)
             )
 
     def validate_block_size(self) -> None:

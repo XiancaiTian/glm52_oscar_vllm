@@ -4,6 +4,8 @@ import pytest
 import torch
 
 from vllm.config.cache import CacheConfig
+from vllm.config.compilation import CUDAGraphMode
+from vllm.config.vllm import VllmConfig
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.attention.backends.mla.triton_mla_sparse import (
@@ -50,3 +52,47 @@ def test_mla_layer_builds_oscar_three_pool_spec() -> None:
     assert spec.history_slot_size == 160
     assert spec.prefix_tokens == 64
     assert spec.recent_tokens == 256
+
+
+@pytest.mark.parametrize(
+    ("override", "reason"),
+    [
+        ({"model_config": SimpleNamespace(enforce_eager=False)}, "non-eager"),
+        (
+            {
+                "compilation_config": SimpleNamespace(
+                    cudagraph_mode=CUDAGraphMode.PIECEWISE
+                )
+            },
+            "CUDA graph",
+        ),
+        ({"speculative_config": SimpleNamespace()}, "speculative"),
+        (
+            {
+                "parallel_config": SimpleNamespace(
+                    decode_context_parallel_size=2,
+                    enable_dbo=False,
+                )
+            },
+            "decode context",
+        ),
+    ],
+)
+def test_oscar_runtime_rejects_unimplemented_modes(
+    override: dict[str, object],
+    reason: str,
+) -> None:
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=True),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
+        speculative_config=None,
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            enable_dbo=False,
+        ),
+    )
+    for name, value in override.items():
+        setattr(config, name, value)
+
+    with pytest.raises(ValueError, match=reason):
+        VllmConfig._validate_oscar_mla_runtime(config)
