@@ -8,7 +8,7 @@ launch remain separate acceptance gates.
 import torch
 
 from vllm.model_executor.layers.quantization.oscar_mla.reference import (
-    mixed_latent_attention,
+    mixed_latent_attention_with_lse,
 )
 from vllm.v1.attention.ops import triton_oscar_mla_decode as decode
 from vllm.v1.attention.ops import triton_oscar_mla_store as store
@@ -97,7 +97,7 @@ output, lse = decode.oscar_mla_sparse_decode(
     rotation,
     num_splits=2,
 )
-expected = mixed_latent_attention(
+expected, expected_lse = mixed_latent_attention_with_lse(
     query.float(),
     prefix_latent=latent[:2].float(),
     recent_latent=latent[3:].float(),
@@ -109,6 +109,7 @@ expected = mixed_latent_attention(
     recent_rope=rope_values[3:].float(),
 )
 torch.testing.assert_close(output, expected, atol=1e-5, rtol=1e-5)
+torch.testing.assert_close(lse, expected_lse, atol=1e-5, rtol=1e-5)
 assert bool(output.isfinite().all())
 assert bool(lse.isfinite().all())
 
@@ -131,26 +132,28 @@ prefill_output, prefill_lse = decode.oscar_mla_sparse_prefill(
     rotation,
     num_splits=2,
 )
-prefill_expected = torch.cat(
-    (
-        mixed_latent_attention(
-            query.float(),
-            prefix_latent=latent[:2].float(),
-            recent_latent=latent[:0].float(),
-            history_rotated=history,
-            rotation=rotation.float(),
-            query_rope=query_rope.float(),
-            prefix_rope=rope_values[:2].float(),
-            history_rope=rope_values[2:3].float(),
-            recent_rope=rope_values[:0].float(),
-        ),
-        expected,
-    ),
-    dim=0,
+prefill_expected_first, prefill_expected_lse_first = mixed_latent_attention_with_lse(
+    query.float(),
+    prefix_latent=latent[:2].float(),
+    recent_latent=latent[:0].float(),
+    history_rotated=history,
+    rotation=rotation.float(),
+    query_rope=query_rope.float(),
+    prefix_rope=rope_values[:2].float(),
+    history_rope=rope_values[2:3].float(),
+    recent_rope=rope_values[:0].float(),
 )
+prefill_expected = torch.cat((prefill_expected_first, expected), dim=0)
+prefill_expected_lse = torch.cat((prefill_expected_lse_first, expected_lse), dim=0)
 torch.testing.assert_close(
     prefill_output,
     prefill_expected,
+    atol=1e-5,
+    rtol=1e-5,
+)
+torch.testing.assert_close(
+    prefill_lse,
+    prefill_expected_lse,
     atol=1e-5,
     rtol=1e-5,
 )
@@ -161,5 +164,7 @@ print(
     f"latent_rank={latent_rank}",
     f"groups={history_scale.shape[-1]}",
     f"max_error={(output - expected).abs().max().item()}",
+    f"lse_max_error={(lse - expected_lse).abs().max().item()}",
     f"prefill_max_error={(prefill_output - prefill_expected).abs().max().item()}",
+    f"prefill_lse_max_error={(prefill_lse - prefill_expected_lse).abs().max().item()}",
 )

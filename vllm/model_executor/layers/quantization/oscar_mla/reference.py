@@ -172,7 +172,7 @@ def rotated_latent_attention(
     return output_rotated @ rotation.T
 
 
-def mixed_latent_attention(
+def mixed_latent_attention_with_lse(
     query: torch.Tensor,
     *,
     prefix_latent: torch.Tensor,
@@ -184,8 +184,8 @@ def mixed_latent_attention(
     history_rope: torch.Tensor | None = None,
     recent_rope: torch.Tensor | None = None,
     scale: float | None = None,
-) -> torch.Tensor:
-    """Compute one softmax across BF16 tiers and rotated history."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute mixed-tier output and natural-log sum-exp."""
     query_rotated = query @ rotation
     rope_tensors = (prefix_rope, history_rope, recent_rope)
     if query_rope is None:
@@ -212,7 +212,8 @@ def mixed_latent_attention(
         history_logits += torch.einsum("...hd,sd->...hs", query_rope, history_rope)
         recent_logits += torch.einsum("...hd,sd->...hs", query_rope, recent_rope)
     logits = torch.cat((prefix_logits, history_logits, recent_logits), dim=-1)
-    weights = torch.softmax(logits * factor, dim=-1)
+    scaled_logits = logits * factor
+    weights = torch.softmax(scaled_logits, dim=-1)
 
     prefix_end = prefix_latent.shape[0]
     history_end = prefix_end + history_rotated.shape[0]
@@ -234,4 +235,34 @@ def mixed_latent_attention(
         weights[..., history_end:],
         recent_latent,
     )
-    return prefix_output + history_output + recent_output
+    output = prefix_output + history_output + recent_output
+    return output, torch.logsumexp(scaled_logits, dim=-1)
+
+
+def mixed_latent_attention(
+    query: torch.Tensor,
+    *,
+    prefix_latent: torch.Tensor,
+    recent_latent: torch.Tensor,
+    history_rotated: torch.Tensor,
+    rotation: torch.Tensor,
+    query_rope: torch.Tensor | None = None,
+    prefix_rope: torch.Tensor | None = None,
+    history_rope: torch.Tensor | None = None,
+    recent_rope: torch.Tensor | None = None,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Compute one softmax across BF16 tiers and rotated history."""
+    output, _ = mixed_latent_attention_with_lse(
+        query,
+        prefix_latent=prefix_latent,
+        recent_latent=recent_latent,
+        history_rotated=history_rotated,
+        rotation=rotation,
+        query_rope=query_rope,
+        prefix_rope=prefix_rope,
+        history_rope=history_rope,
+        recent_rope=recent_rope,
+        scale=scale,
+    )
+    return output

@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.quantization.oscar_mla.reference import (
-    mixed_latent_attention,
+    mixed_latent_attention_with_lse,
 )
 from vllm.v1.attention.ops.triton_oscar_mla_decode import (
     oscar_mla_sparse_decode,
@@ -49,7 +49,9 @@ def test_triton_interpreter_smoke() -> None:
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "latent_rank=512" in completed.stdout
     assert "max_error=" in completed.stdout
+    assert "lse_max_error=" in completed.stdout
     assert "prefill_max_error=" in completed.stdout
+    assert "prefill_lse_max_error=" in completed.stdout
 
 
 def _rotation(dim: int, *, device: torch.device) -> torch.Tensor:
@@ -57,6 +59,27 @@ def _rotation(dim: int, *, device: torch.device) -> torch.Tensor:
     matrix = torch.randn(dim, dim, generator=generator, device=device)
     q, _ = torch.linalg.qr(matrix.float())
     return q.to(torch.bfloat16)
+
+
+def _assert_oracle(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    expected: torch.Tensor,
+    expected_lse: torch.Tensor,
+    *,
+    label: str,
+) -> None:
+    output_error = (output - expected).abs()
+    lse_error = (lse - expected_lse).abs()
+    print(
+        f"{label} "
+        f"output_max_error={output_error.max().item()} "
+        f"output_mean_error={output_error.mean().item()} "
+        f"lse_max_error={lse_error.max().item()} "
+        f"lse_mean_error={lse_error.mean().item()}"
+    )
+    torch.testing.assert_close(output, expected, atol=0.5, rtol=0.03)
+    torch.testing.assert_close(lse, expected_lse, atol=0.05, rtol=0.01)
 
 
 def _pack_rope_cache(
@@ -233,7 +256,7 @@ def test_sparse_decode_matches_three_pool_oracle(
 
     prefix_end = min(seq_len, prefix_tokens)
     recent_start = max(prefix_end, seq_len - recent_tokens)
-    expected = mixed_latent_attention(
+    expected, expected_lse = mixed_latent_attention_with_lse(
         query.float(),
         prefix_latent=latent[:prefix_end].float(),
         recent_latent=latent[recent_start:].float(),
@@ -244,7 +267,13 @@ def test_sparse_decode_matches_three_pool_oracle(
         history_rope=rope_values[prefix_end:recent_start].float(),
         recent_rope=rope_values[recent_start:].float(),
     )
-    torch.testing.assert_close(output, expected, atol=0.5, rtol=0.03)
+    _assert_oracle(
+        output,
+        lse,
+        expected,
+        expected_lse,
+        label=f"decode_heads={num_heads}_seq={seq_len}",
+    )
     assert torch.isfinite(output).all()
     assert torch.isfinite(lse).all()
 
@@ -320,7 +349,7 @@ def test_sparse_decode_respects_selected_token_ids() -> None:
     )
     selected = torch.tensor([[0, 64, 320]], dtype=torch.int32, device=device)
 
-    output, _ = oscar_mla_sparse_decode(
+    output, lse = oscar_mla_sparse_decode(
         query,
         query_rope,
         selected,
@@ -338,7 +367,7 @@ def test_sparse_decode_respects_selected_token_ids() -> None:
         num_splits=3,
     )
 
-    expected = mixed_latent_attention(
+    expected, expected_lse = mixed_latent_attention_with_lse(
         query.float(),
         prefix_latent=latent[0:1].float(),
         recent_latent=latent[320:321].float(),
@@ -349,7 +378,13 @@ def test_sparse_decode_respects_selected_token_ids() -> None:
         history_rope=rope_values[64:65].float(),
         recent_rope=rope_values[320:321].float(),
     )
-    torch.testing.assert_close(output, expected, atol=0.5, rtol=0.03)
+    _assert_oracle(
+        output,
+        lse,
+        expected,
+        expected_lse,
+        label="decode_selected_ids",
+    )
 
 
 @requires_cuda
@@ -476,26 +511,34 @@ def test_sparse_prefill_is_causal_and_matches_three_pool_oracle(
     )
 
     expected_rows = []
+    expected_lse_rows = []
     for row, query_position in enumerate(query_positions.tolist()):
         causal_length = query_position + 1
-        expected_rows.append(
-            mixed_latent_attention(
-                query[row : row + 1].float(),
-                prefix_latent=latent[: min(64, causal_length)].float(),
-                recent_latent=latent[65:causal_length].float(),
-                history_rotated=(
-                    history_rotated if causal_length > 64 else history_rotated[:0]
-                ),
-                rotation=rotation.float(),
-                query_rope=query_rope[row : row + 1].float(),
-                prefix_rope=rope_values[: min(64, causal_length)].float(),
-                history_rope=(
-                    rope_values[64:65] if causal_length > 64 else rope_values[:0]
-                ).float(),
-                recent_rope=rope_values[65:causal_length].float(),
-            )
+        expected_row, expected_lse_row = mixed_latent_attention_with_lse(
+            query[row : row + 1].float(),
+            prefix_latent=latent[: min(64, causal_length)].float(),
+            recent_latent=latent[65:causal_length].float(),
+            history_rotated=(
+                history_rotated if causal_length > 64 else history_rotated[:0]
+            ),
+            rotation=rotation.float(),
+            query_rope=query_rope[row : row + 1].float(),
+            prefix_rope=rope_values[: min(64, causal_length)].float(),
+            history_rope=(
+                rope_values[64:65] if causal_length > 64 else rope_values[:0]
+            ).float(),
+            recent_rope=rope_values[65:causal_length].float(),
         )
+        expected_rows.append(expected_row)
+        expected_lse_rows.append(expected_lse_row)
     expected = torch.cat(expected_rows, dim=0)
-    torch.testing.assert_close(output, expected, atol=0.5, rtol=0.03)
+    expected_lse = torch.cat(expected_lse_rows, dim=0)
+    _assert_oracle(
+        output,
+        lse,
+        expected,
+        expected_lse,
+        label=f"prefill_batch={num_queries}",
+    )
     assert torch.isfinite(output).all()
     assert torch.isfinite(lse).all()
