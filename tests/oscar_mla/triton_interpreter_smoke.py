@@ -159,6 +159,157 @@ torch.testing.assert_close(
 )
 assert bool(prefill_output.isfinite().all())
 assert bool(prefill_lse.isfinite().all())
+
+request_count = 2
+batched_latent = torch.randn(
+    request_count,
+    sequence_length,
+    latent_rank,
+    dtype=torch.bfloat16,
+)
+batched_query = torch.randn(
+    request_count,
+    1,
+    latent_rank,
+    dtype=torch.bfloat16,
+)
+batched_rope_values = torch.randn(
+    request_count,
+    sequence_length,
+    64,
+    dtype=torch.bfloat16,
+)
+batched_query_rope = torch.randn(
+    request_count,
+    1,
+    64,
+    dtype=torch.bfloat16,
+)
+batched_prefix = torch.zeros(
+    request_count,
+    2,
+    latent_rank,
+    dtype=torch.bfloat16,
+)
+batched_recent = torch.zeros_like(batched_prefix)
+batched_positions = torch.arange(sequence_length, dtype=torch.int32).repeat(
+    request_count
+)
+batched_hp_rows = torch.arange(request_count, dtype=torch.int32).repeat_interleave(
+    sequence_length
+)
+store.oscar_mla_store_bf16(
+    batched_latent.flatten(0, 1),
+    batched_prefix,
+    batched_recent,
+    batched_positions,
+    torch.full_like(batched_positions, sequence_length),
+    batched_hp_rows,
+)
+
+batched_rope_cache = torch.zeros(
+    request_count,
+    16,
+    64,
+    dtype=torch.bfloat16,
+)
+batched_rope_slots = (
+    torch.arange(request_count, dtype=torch.int32).repeat_interleave(sequence_length)
+    * 16
+    + batched_positions
+)
+store.oscar_mla_store_rope(
+    batched_rope_values.flatten(0, 1),
+    batched_rope_cache,
+    batched_rope_slots,
+)
+batched_rope_block_table = torch.arange(
+    request_count,
+    dtype=torch.int32,
+).unsqueeze(1)
+
+batched_history_data = torch.zeros(
+    request_count,
+    16,
+    latent_rank // 4,
+    dtype=torch.uint8,
+)
+batched_history_scale = torch.zeros(
+    request_count,
+    16,
+    latent_rank // 128,
+    dtype=torch.float32,
+)
+batched_history_zero = torch.zeros_like(batched_history_scale)
+batched_page_ids = torch.arange(request_count, dtype=torch.int32)
+store.oscar_mla_rotate_quantize_store(
+    batched_latent[:, 2],
+    rotation,
+    batched_history_data,
+    batched_history_scale,
+    batched_history_zero,
+    batched_page_ids,
+    torch.zeros(request_count, dtype=torch.int32),
+    clip_ratio=0.96,
+)
+batched_history = store.oscar_mla_dequantize_history(
+    batched_history_data,
+    batched_history_scale,
+    batched_history_zero,
+    batched_page_ids,
+    torch.zeros(request_count, dtype=torch.int32),
+)
+batched_output, batched_lse = decode.oscar_mla_sparse_decode(
+    batched_query,
+    batched_query_rope,
+    torch.arange(sequence_length, dtype=torch.int32).repeat(request_count, 1),
+    batched_prefix,
+    batched_recent,
+    batched_rope_cache,
+    batched_rope_block_table,
+    batched_history_data,
+    batched_history_scale,
+    batched_history_zero,
+    batched_page_ids.unsqueeze(1),
+    torch.arange(request_count, dtype=torch.int32),
+    torch.full((request_count,), sequence_length, dtype=torch.int32),
+    rotation,
+    num_splits=2,
+)
+batched_expected_rows = []
+batched_expected_lse_rows = []
+for request_index in range(request_count):
+    expected_row, expected_lse_row = mixed_latent_attention_with_lse(
+        batched_query[request_index : request_index + 1].float(),
+        prefix_latent=batched_latent[request_index, :2].float(),
+        recent_latent=batched_latent[request_index, 3:].float(),
+        history_rotated=batched_history[request_index : request_index + 1],
+        rotation=rotation.float(),
+        query_rope=batched_query_rope[request_index : request_index + 1].float(),
+        prefix_rope=batched_rope_values[request_index, :2].float(),
+        history_rope=batched_rope_values[request_index, 2:3].float(),
+        recent_rope=batched_rope_values[request_index, 3:].float(),
+    )
+    batched_expected_rows.append(expected_row)
+    batched_expected_lse_rows.append(expected_lse_row)
+batched_expected = torch.cat(batched_expected_rows)
+batched_expected_lse = torch.cat(batched_expected_lse_rows)
+torch.testing.assert_close(
+    batched_output,
+    batched_expected,
+    atol=1e-5,
+    rtol=1e-5,
+)
+torch.testing.assert_close(
+    batched_lse,
+    batched_expected_lse,
+    atol=1e-5,
+    rtol=1e-5,
+)
+assert bool(batched_output.isfinite().all())
+assert bool(batched_lse.isfinite().all())
+multi_request_error = (batched_output - batched_expected).abs().max().item()
+multi_request_lse_error = (batched_lse - batched_expected_lse).abs().max().item()
 print(
     "interpreter_smoke",
     f"latent_rank={latent_rank}",
@@ -167,4 +318,6 @@ print(
     f"lse_max_error={(lse - expected_lse).abs().max().item()}",
     f"prefill_max_error={(prefill_output - prefill_expected).abs().max().item()}",
     f"prefill_lse_max_error={(prefill_lse - prefill_expected_lse).abs().max().item()}",
+    f"multi_request_max_error={multi_request_error}",
+    f"multi_request_lse_max_error={multi_request_lse_error}",
 )

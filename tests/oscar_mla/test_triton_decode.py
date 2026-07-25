@@ -52,6 +52,8 @@ def test_triton_interpreter_smoke() -> None:
     assert "lse_max_error=" in completed.stdout
     assert "prefill_max_error=" in completed.stdout
     assert "prefill_lse_max_error=" in completed.stdout
+    assert "multi_request_max_error=" in completed.stdout
+    assert "multi_request_lse_max_error=" in completed.stdout
 
 
 def _rotation(dim: int, *, device: torch.device) -> torch.Tensor:
