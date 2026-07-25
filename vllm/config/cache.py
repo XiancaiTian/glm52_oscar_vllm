@@ -31,6 +31,7 @@ CacheDType = Literal[
     "int8_per_token_head",
     "fp8_per_token_head",
     "nvfp4",
+    "oscar_mla_int2",
 ]
 MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
@@ -219,6 +220,11 @@ class CacheConfig:
             object.__setattr__(self, "user_specified_block_size", True)
         if self.mamba_block_size is not None:
             object.__setattr__(self, "user_specified_mamba_block_size", True)
+        if self.cache_dtype == "oscar_mla_int2" and self.enable_prefix_caching:
+            raise ValueError(
+                "oscar_mla_int2 does not support vLLM prefix caching; "
+                "set enable_prefix_caching=False"
+            )
         return self
 
     @field_validator("calculate_kv_scales", mode="after")

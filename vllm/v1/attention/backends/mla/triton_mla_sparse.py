@@ -18,13 +18,13 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionLayer,
 )
+from vllm.v1.attention.backends.mla.flashmla_sparse import (
+    triton_convert_req_index_to_global_index,
+)
 from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
     XPUMLASparseImpl,
     XPUMLASparseMetadata,
     XPUMLASparseMetadataBuilder,
-)
-from vllm.v1.attention.backends.mla.flashmla_sparse import (
-    triton_convert_req_index_to_global_index,
 )
 from vllm.v1.attention.ops.mqa_logits_triton import (
     warmup_fp8_mqa_logits_triton,
@@ -414,6 +414,7 @@ class TritonMLASparseBackend(AttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        "oscar_mla_int2",
     ]
 
     @staticmethod

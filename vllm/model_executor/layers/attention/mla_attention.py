@@ -281,6 +281,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,
+    OscarMLAAttentionSpec,
 )
 
 logger = init_logger(__name__)
@@ -965,6 +966,32 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        if self.kv_cache_dtype == "oscar_mla_int2":
+            if not self.use_sparse:
+                raise ValueError("oscar_mla_int2 requires sparse MLA")
+            if self.attn_backend.get_name() != "TRITON_MLA_SPARSE":
+                raise ValueError(
+                    "oscar_mla_int2 requires the TRITON_MLA_SPARSE backend"
+                )
+            if vllm_config.cache_config.enable_prefix_caching:
+                raise ValueError("oscar_mla_int2 does not support prefix caching")
+            group_size = 128
+            history_slot_size = (
+                self.kv_lora_rank * 2 // 8 + (self.kv_lora_rank // group_size) * 2 * 4
+            )
+            return OscarMLAAttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=1,
+                head_size=self.head_size,
+                dtype=torch.bfloat16,
+                cache_dtype_str=self.kv_cache_dtype,
+                latent_rank=self.kv_lora_rank,
+                rope_head_size=self.qk_rope_head_dim,
+                history_slot_size=history_slot_size,
+                group_size=group_size,
+                prefix_tokens=64,
+                recent_tokens=256,
+            )
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
