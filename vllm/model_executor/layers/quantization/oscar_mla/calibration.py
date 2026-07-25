@@ -1,5 +1,7 @@
 """Covariance helpers for shared-latent OSCAR calibration."""
 
+import math
+
 import torch
 
 
@@ -71,3 +73,41 @@ def covariance_rotation(covariance: torch.Tensor) -> torch.Tensor:
     eigenvalues, eigenvectors = torch.linalg.eigh(symmetric)
     order = torch.argsort(eigenvalues, descending=True)
     return eigenvectors[:, order]
+
+
+def normalized_hadamard(rank: int) -> torch.Tensor:
+    """Build a normalized Sylvester Hadamard matrix in FP64."""
+    if rank <= 0 or rank & (rank - 1):
+        raise ValueError(f"Hadamard rank must be a power of two, got {rank}")
+    matrix = torch.ones(1, 1, dtype=torch.float64)
+    while matrix.shape[0] < rank:
+        matrix = torch.cat(
+            (
+                torch.cat((matrix, matrix), dim=1),
+                torch.cat((matrix, -matrix), dim=1),
+            ),
+            dim=0,
+        )
+    return matrix / math.sqrt(rank)
+
+
+def bit_reversal_permutation(rank: int) -> torch.Tensor:
+    """Return the bit-reversed indices for a power-of-two latent rank."""
+    if rank <= 0 or rank & (rank - 1):
+        raise ValueError(f"bit-reversal rank must be a power of two, got {rank}")
+    bits = int(math.log2(rank))
+    return torch.tensor(
+        [int(f"{index:0{bits}b}"[::-1], 2) for index in range(rank)],
+        dtype=torch.int64,
+    )
+
+
+def oscar_covariance_rotation(covariance: torch.Tensor) -> torch.Tensor:
+    """Compose the shared eigenbasis with normalized Hadamard and PBR."""
+    eigenbasis = covariance_rotation(covariance)
+    rank = eigenbasis.shape[0]
+    hadamard = normalized_hadamard(rank)
+    permutation = torch.eye(rank, dtype=torch.float64)[
+        :, bit_reversal_permutation(rank)
+    ]
+    return eigenbasis @ hadamard @ permutation
