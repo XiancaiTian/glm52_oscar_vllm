@@ -233,6 +233,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+from vllm.model_executor.layers.quantization.oscar_mla.capture import (
+    capture_mla_activations,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     QuantKey,
@@ -781,6 +784,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         get_dcp_group(),
                         is_lse_base_on_e=not getattr(self, "_use_fi_prefill", False),
                     )
+
+            capture_mla_activations(
+                self.layer_name,
+                k_c_normed,
+                mqa_ql_nope,
+                attn_out,
+                getattr(self.impl, "topk_indices_buffer", None),
+            )
 
             # v_up projection
             self._v_up_proj(attn_out, out=mqa_output_slice)
