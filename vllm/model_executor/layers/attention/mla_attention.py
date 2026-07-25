@@ -419,6 +419,32 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.kv_cache_dtype = kv_cache_dtype
         self.calculate_kv_scales = calculate_kv_scales
         _init_kv_cache_quant(self, quant_config, prefix)
+        if self.kv_cache_dtype == "oscar_mla_int2":
+            from vllm.model_executor.layers.quantization.oscar_mla.runtime import (
+                load_layer_runtime_parameters,
+            )
+
+            runtime_parameters = load_layer_runtime_parameters(
+                self.layer_name,
+                latent_rank=self.kv_lora_rank,
+                prefix_tokens=64,
+                recent_tokens=256,
+            )
+            self.register_buffer(
+                "_oscar_rotation",
+                runtime_parameters.rotation,
+                persistent=False,
+            )
+            self._oscar_clip_ratio = runtime_parameters.clip_ratio
+            self._oscar_artifact_manifest_sha256 = (
+                runtime_parameters.manifest_sha256
+            )
+            self._oscar_rotations_sha256 = runtime_parameters.rotations_sha256
+            logger.info_once(
+                "OSCAR MLA rotation artifact loaded: manifest=%s tensors=%s",
+                self._oscar_artifact_manifest_sha256,
+                self._oscar_rotations_sha256,
+            )
 
         if (
             cache_config is not None
@@ -843,6 +869,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_b_proj_weight = get_and_maybe_dequant_weights(
             self.kv_b_proj, out_dtype=act_dtype
         ).T
+        if self.kv_cache_dtype == "oscar_mla_int2":
+            self._oscar_rotation = self._oscar_rotation.to(
+                device=kv_b_proj_weight.device,
+            )
 
         assert kv_b_proj_weight.shape == (
             self.kv_lora_rank,
