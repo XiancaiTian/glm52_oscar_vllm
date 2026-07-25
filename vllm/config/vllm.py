@@ -1854,8 +1854,14 @@ class VllmConfig:
             unsupported.append("speculative decoding")
         if self.parallel_config.decode_context_parallel_size > 1:
             unsupported.append("decode context parallelism")
+        if self.parallel_config.prefill_context_parallel_size > 1:
+            unsupported.append("prefill context parallelism")
         if self.parallel_config.enable_dbo:
             unsupported.append("dual batch overlap")
+        if self.kv_transfer_config is not None:
+            unsupported.append("KV transfer")
+        if self.cache_config.kv_offloading_size is not None:
+            unsupported.append("KV offloading")
         if unsupported:
             raise ValueError(
                 "oscar_mla_int2 does not yet support: " + ", ".join(unsupported)

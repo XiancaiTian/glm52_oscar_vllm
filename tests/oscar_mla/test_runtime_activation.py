@@ -71,10 +71,26 @@ def test_mla_layer_builds_oscar_three_pool_spec() -> None:
             {
                 "parallel_config": SimpleNamespace(
                     decode_context_parallel_size=2,
+                    prefill_context_parallel_size=1,
                     enable_dbo=False,
                 )
             },
             "decode context",
+        ),
+        (
+            {
+                "parallel_config": SimpleNamespace(
+                    decode_context_parallel_size=1,
+                    prefill_context_parallel_size=2,
+                    enable_dbo=False,
+                )
+            },
+            "prefill context",
+        ),
+        ({"kv_transfer_config": SimpleNamespace()}, "KV transfer"),
+        (
+            {"cache_config": SimpleNamespace(kv_offloading_size=8)},
+            "KV offloading",
         ),
     ],
 )
@@ -88,8 +104,11 @@ def test_oscar_runtime_rejects_unimplemented_modes(
         speculative_config=None,
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
             enable_dbo=False,
         ),
+        kv_transfer_config=None,
+        cache_config=SimpleNamespace(kv_offloading_size=None),
     )
     for name, value in override.items():
         setattr(config, name, value)

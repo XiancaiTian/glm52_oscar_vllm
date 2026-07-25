@@ -32,6 +32,7 @@ def test_triton_interpreter_smoke() -> None:
         {
             "CUDA_VISIBLE_DEVICES": "",
             "HF_HUB_OFFLINE": "1",
+            "PYTHONPATH": str(Path(__file__).parents[2]),
             "TRANSFORMERS_OFFLINE": "1",
             "TRITON_INTERPRET": "1",
         }
