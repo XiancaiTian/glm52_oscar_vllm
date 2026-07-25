@@ -197,6 +197,112 @@ def plan_mla_cache(
     )
 
 
+@dataclass(frozen=True)
+class MLARuntimeCachePlan:
+    """Joint budget for latent pools and uncompressed auxiliary caches."""
+
+    geometry: MLACacheGeometry
+    total_memory_bytes: int
+    max_num_seqs: int
+    num_blocks: int
+    rope_bytes_per_layer_token: int
+    auxiliary_bytes_per_block: int
+    unused_bytes: int
+
+    @property
+    def usable_blocks(self) -> int:
+        # vLLM reserves block ID 0 as its null block.
+        return self.num_blocks - 1
+
+    @property
+    def logical_token_slots(self) -> int:
+        return self.usable_blocks * self.geometry.block_size
+
+    @property
+    def history_pages(self) -> int:
+        # History has an independent page namespace and no null block.
+        return self.num_blocks
+
+    @property
+    def fixed_bf16_bytes(self) -> int:
+        slots = self.max_num_seqs * (
+            self.geometry.prefix_tokens + self.geometry.recent_tokens
+        )
+        return slots * self.geometry.bf16_token_bytes
+
+    @property
+    def history_bytes(self) -> int:
+        return self.history_pages * self.geometry.history_page_bytes
+
+    @property
+    def rope_bytes(self) -> int:
+        return (
+            self.num_blocks
+            * self.geometry.block_size
+            * self.geometry.num_layers
+            * self.rope_bytes_per_layer_token
+        )
+
+    @property
+    def auxiliary_bytes(self) -> int:
+        return self.num_blocks * self.auxiliary_bytes_per_block
+
+    @property
+    def allocated_bytes(self) -> int:
+        return (
+            self.fixed_bf16_bytes
+            + self.history_bytes
+            + self.rope_bytes
+            + self.auxiliary_bytes
+        )
+
+
+def plan_mla_runtime_cache(
+    geometry: MLACacheGeometry,
+    *,
+    total_memory_bytes: int,
+    max_num_seqs: int,
+    rope_bytes_per_layer_token: int,
+    auxiliary_bytes_per_block: int,
+) -> MLARuntimeCachePlan:
+    if total_memory_bytes <= 0:
+        raise ValueError("total_memory_bytes must be positive")
+    if max_num_seqs <= 0:
+        raise ValueError("max_num_seqs must be positive")
+    if rope_bytes_per_layer_token <= 0:
+        raise ValueError("rope_bytes_per_layer_token must be positive")
+    if auxiliary_bytes_per_block < 0:
+        raise ValueError("auxiliary_bytes_per_block must be non-negative")
+
+    fixed_slots = max_num_seqs * (geometry.prefix_tokens + geometry.recent_tokens)
+    fixed_bf16_bytes = fixed_slots * geometry.bf16_token_bytes
+    if fixed_bf16_bytes >= total_memory_bytes:
+        raise MLACacheCapacityError(
+            "BF16 prefix/recent pools consume the cache budget: "
+            f"required={fixed_bf16_bytes}, budget={total_memory_bytes}"
+        )
+    variable_bytes_per_block = (
+        geometry.history_page_bytes
+        + geometry.num_layers * geometry.block_size * rope_bytes_per_layer_token
+        + auxiliary_bytes_per_block
+    )
+    num_blocks = (total_memory_bytes - fixed_bf16_bytes) // variable_bytes_per_block
+    if num_blocks <= 1:
+        raise MLACacheCapacityError(
+            "cache budget has no usable block after the vLLM null block"
+        )
+    allocated = fixed_bf16_bytes + num_blocks * variable_bytes_per_block
+    return MLARuntimeCachePlan(
+        geometry=geometry,
+        total_memory_bytes=total_memory_bytes,
+        max_num_seqs=max_num_seqs,
+        num_blocks=num_blocks,
+        rope_bytes_per_layer_token=rope_bytes_per_layer_token,
+        auxiliary_bytes_per_block=auxiliary_bytes_per_block,
+        unused_bytes=total_memory_bytes - allocated,
+    )
+
+
 @dataclass
 class _IndexPool:
     capacity: int
@@ -294,6 +400,32 @@ class MLATriPoolAllocator:
         self._next_generation = 1
         self.requests: dict[str, RequestOwnership] = {}
 
+    def required_history_pages(self, request_id: str, new_length: int) -> int:
+        request = self.requests.get(request_id)
+        current_length = request.logical_length if request is not None else 0
+        current_history = request.history_tokens if request is not None else 0
+        partial_slots = request.partial_history_slots if request is not None else 0
+        if new_length < current_length:
+            raise ValueError("logical length must not decrease")
+        target_history = self.plan.geometry.partition(new_length).history
+        new_history = target_history - current_history
+        available = (
+            self.plan.geometry.block_size - partial_slots
+            if request is not None and request.partial_history_page is not None
+            else 0
+        )
+        return _ceil_div(
+            max(0, new_history - available),
+            self.plan.geometry.block_size,
+        )
+
+    def can_update_length(self, request_id: str, new_length: int) -> bool:
+        if request_id not in self.requests and not self._rows.free:
+            return False
+        return self.required_history_pages(request_id, new_length) <= len(
+            self._history.free
+        )
+
     def start_request(self, request_id: str) -> RequestOwnership:
         if request_id in self.requests:
             raise RuntimeError(f"duplicate request: {request_id}")
@@ -322,7 +454,7 @@ class MLATriPoolAllocator:
             if request.partial_history_page is not None
             else 0
         )
-        pages_needed = _ceil_div(max(0, new_history - available), block_size)
+        pages_needed = self.required_history_pages(request_id, new_length)
         new_pages = self._history.allocate(pages_needed)
 
         remaining = new_history

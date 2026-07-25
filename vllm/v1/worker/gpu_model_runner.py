@@ -148,6 +148,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
+    OscarMLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -198,6 +199,10 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.oscar_mla_cache import (
+    OscarMLAWorkerOwnership,
+    reshape_oscar_mla_cache,
+)
 from vllm.v1.worker.pp_spec_broadcast import (
     count_valid_sampled_tokens_per_req,
     gather_valid_sampled_tokens_per_req,
@@ -582,6 +587,7 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self.oscar_mla_ownership = OscarMLAWorkerOwnership()
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -1263,6 +1269,8 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        self.oscar_mla_ownership.apply(scheduler_output)
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -8513,6 +8521,16 @@ class GPUModelRunner(
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
+                if isinstance(kv_cache_spec, OscarMLAAttentionSpec):
+                    max_num_seqs = self.kv_cache_config.oscar_mla_max_num_seqs
+                    assert max_num_seqs is not None
+                    kv_caches[layer_name] = reshape_oscar_mla_cache(
+                        raw_tensor,
+                        kv_cache_spec,
+                        num_blocks=self.kv_cache_config.num_blocks,
+                        max_num_seqs=max_num_seqs,
+                    )
+                    continue
                 assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
                 num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
