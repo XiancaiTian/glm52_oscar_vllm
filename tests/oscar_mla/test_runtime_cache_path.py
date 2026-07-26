@@ -16,9 +16,9 @@ from vllm.v1.worker.oscar_mla_cache import (
 )
 
 
-def _cache() -> OscarMLACacheTensors:
+def _cache(*, raw_size: int = 0) -> OscarMLACacheTensors:
     return OscarMLACacheTensors(
-        raw=torch.empty(0, dtype=torch.int8),
+        raw=torch.empty(raw_size, dtype=torch.int8),
         history_data=torch.zeros(12, 16, 128, dtype=torch.uint8),
         history_scale=torch.zeros(12, 16, 4),
         history_zero=torch.zeros(12, 16, 4),
@@ -117,6 +117,67 @@ def test_unified_update_handles_empty_oscar_profile_tensor(monkeypatch) -> None:
     )
 
     assert result.numel() == 0
+
+
+def test_unified_update_skips_oscar_compile_warmup_without_metadata(
+    monkeypatch,
+) -> None:
+    def unexpected_update(*args, **kwargs) -> None:
+        raise AssertionError("compile warmup must not update the OSCAR cache")
+
+    layer = SimpleNamespace(
+        kv_cache=_cache(raw_size=1),
+        impl=SimpleNamespace(do_oscar_kv_cache_update=unexpected_update),
+    )
+    context = SimpleNamespace(
+        no_compile_layers={"layer": layer},
+        slot_mapping={"layer": torch.empty(0, dtype=torch.int64)},
+        attn_metadata=None,
+    )
+    monkeypatch.setattr(mla_attention, "_resolve_layer_name", lambda name: name)
+    monkeypatch.setattr(mla_attention, "get_forward_context", lambda: context)
+
+    result = mla_attention.unified_mla_kv_cache_update(
+        torch.empty(0, 512),
+        torch.empty(0, 1, 64),
+        "layer",
+        "oscar_mla_int2",
+        torch.tensor(1.0),
+    )
+
+    assert result.numel() == 0
+
+
+def test_direct_update_skips_oscar_compile_warmup_without_metadata(
+    monkeypatch,
+) -> None:
+    def unexpected_update(*args, **kwargs) -> None:
+        raise AssertionError("compile warmup must not update the OSCAR cache")
+
+    layer = SimpleNamespace(
+        calculate_kv_scales=False,
+        use_direct_call=True,
+        layer_name="layer",
+        kv_cache_dtype="oscar_mla_int2",
+        kv_cache=_cache(raw_size=1),
+        impl=SimpleNamespace(do_oscar_kv_cache_update=unexpected_update),
+        forward_impl=lambda *args, **kwargs: kwargs["output"].fill_(1),
+    )
+    context = SimpleNamespace(
+        attn_metadata=None,
+        slot_mapping={"layer": torch.empty(0, dtype=torch.int64)},
+    )
+    monkeypatch.setattr(mla_attention, "get_forward_context", lambda: context)
+
+    result = mla_attention.MLAAttention.forward(
+        layer,
+        torch.empty(0, 512),
+        torch.empty(0, 512),
+        torch.empty(0, 1, 64),
+        output_shape=torch.Size([1, 2]),
+    )
+
+    torch.testing.assert_close(result, torch.ones_like(result))
 
 
 def test_runtime_write_demotes_before_overwriting_recent(monkeypatch) -> None:

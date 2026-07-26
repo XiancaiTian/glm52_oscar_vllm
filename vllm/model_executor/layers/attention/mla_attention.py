@@ -574,14 +574,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
             )
             if self.kv_cache_dtype == "oscar_mla_int2":
-                self.impl.do_oscar_kv_cache_update(  # type: ignore[attr-defined]
-                    kv_c_normed,
-                    k_pe,
-                    self_kv_cache,
-                    attn_metadata,
-                    self._oscar_rotation,
-                    clip_ratio=self._oscar_clip_ratio,
-                )
+                if attn_metadata is not None:
+                    self.impl.do_oscar_kv_cache_update(  # type: ignore[attr-defined]
+                        kv_c_normed,
+                        k_pe,
+                        self_kv_cache,
+                        attn_metadata,
+                        self._oscar_rotation,
+                        clip_ratio=self._oscar_clip_ratio,
+                    )
             else:
                 self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
                     kv_c_normed,
@@ -1119,6 +1120,8 @@ def unified_mla_kv_cache_update(
             attn_metadata = attn_metadata_raw[0][layer_name]
         else:
             attn_metadata = attn_metadata_raw
+        if attn_metadata is None:
+            return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
         attn_layer.impl.do_oscar_kv_cache_update(
             kv_c_normed,
             k_pe,
