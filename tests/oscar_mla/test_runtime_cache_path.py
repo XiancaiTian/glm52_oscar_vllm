@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
+from vllm.model_executor.layers.attention import mla_attention
 from vllm.v1.attention.backends.mla import triton_mla_sparse
 from vllm.v1.attention.backends.mla.triton_mla_sparse import (
     TritonMLASparseImpl,
@@ -82,6 +83,23 @@ def _impl() -> TritonMLASparseImpl:
     impl.oscar_demotion_calls = 0
     impl.oscar_read_calls = 0
     return impl
+
+
+def test_unified_update_handles_empty_oscar_cache(monkeypatch) -> None:
+    layer = SimpleNamespace(kv_cache=_cache())
+    context = SimpleNamespace(no_compile_layers={"layer": layer})
+    monkeypatch.setattr(mla_attention, "_resolve_layer_name", lambda name: name)
+    monkeypatch.setattr(mla_attention, "get_forward_context", lambda: context)
+
+    result = mla_attention.unified_mla_kv_cache_update(
+        torch.empty(0, 512),
+        torch.empty(0, 1, 64),
+        "layer",
+        "oscar_mla_int2",
+        torch.tensor(1.0),
+    )
+
+    assert result.numel() == 0
 
 
 def test_runtime_write_demotes_before_overwriting_recent(monkeypatch) -> None:

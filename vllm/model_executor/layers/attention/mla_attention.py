@@ -436,9 +436,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 persistent=False,
             )
             self._oscar_clip_ratio = runtime_parameters.clip_ratio
-            self._oscar_artifact_manifest_sha256 = (
-                runtime_parameters.manifest_sha256
-            )
+            self._oscar_artifact_manifest_sha256 = runtime_parameters.manifest_sha256
             self._oscar_rotations_sha256 = runtime_parameters.rotations_sha256
             logger.info_once(
                 "OSCAR MLA rotation artifact loaded: manifest=%s tensors=%s",
@@ -1100,7 +1098,8 @@ def unified_mla_kv_cache_update(
 
     # This needs to run even when we don't have metadata yet, so that the op
     # is correctly captured.
-    if kv_cache.numel() == 0:
+    cache_storage = kv_cache.raw if kv_cache_dtype == "oscar_mla_int2" else kv_cache
+    if cache_storage.numel() == 0:
         # Can't update an empty KV cache.
         return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
 
