@@ -1219,16 +1219,31 @@ def get_kv_cache_config_from_groups(
         assert sum(tensor.size for tensor in kv_cache_tensors) == plan.allocated_bytes
         if not suppress_log:
             logger.info(
-                "OSCAR MLA pools: logical capacity=%d tokens, INT2 history=%d "
-                "pages (%s), BF16 prefix/recent=%s, RoPE=%s, native auxiliary=%s, "
-                "unused=%s",
+                "OSCAR MLA pools: logical capacity=%d tokens, BF16 prefix=%d "
+                "slots/%d bytes (%s GiB), BF16 recent=%d slots/%d bytes "
+                "(%s GiB), INT2 history=%d slots/%d pages/%d bytes (%s GiB), "
+                "RoPE=%d bytes (%s GiB), native index/cache=%d bytes (%s GiB), "
+                "unused=%d bytes, BF16 history=absent, compression ratios "
+                "theoretical=%.10fx padded=%.10fx allocated=%.10fx",
                 plan.logical_token_slots,
+                plan.fixed_prefix_slots,
+                plan.fixed_prefix_bytes,
+                format_gib(plan.fixed_prefix_bytes),
+                plan.fixed_recent_slots,
+                plan.fixed_recent_bytes,
+                format_gib(plan.fixed_recent_bytes),
+                plan.history_slots,
                 plan.history_pages,
+                plan.history_bytes,
                 format_gib(plan.history_bytes),
-                format_gib(plan.fixed_bf16_bytes),
+                plan.rope_bytes,
                 format_gib(plan.rope_bytes),
+                plan.auxiliary_bytes,
                 format_gib(plan.auxiliary_bytes),
-                format_gib(plan.unused_bytes),
+                plan.unused_bytes,
+                plan.theoretical_history_compression_ratio,
+                plan.padded_history_compression_ratio,
+                plan.allocated_capacity_ratio,
             )
     elif len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs

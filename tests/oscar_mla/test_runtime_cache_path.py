@@ -10,6 +10,10 @@ from vllm.v1.attention.backends.mla.triton_mla_sparse import (
 from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
     XPUMLASparseMetadata,
 )
+from vllm.v1.worker.gpu_worker import (
+    _collect_oscar_mla_call_counts,
+    _find_oscar_mla_impls,
+)
 from vllm.v1.worker.oscar_mla_cache import (
     OscarMLABatchMetadata,
     OscarMLACacheTensors,
@@ -83,6 +87,52 @@ def _impl() -> TritonMLASparseImpl:
     impl.oscar_demotion_calls = 0
     impl.oscar_read_calls = 0
     return impl
+
+
+def test_runtime_call_counts_aggregate_all_oscar_layers() -> None:
+    first = SimpleNamespace(
+        kv_cache_dtype="oscar_mla_int2",
+        oscar_write_calls=7,
+        oscar_demotion_calls=3,
+        oscar_read_calls=6,
+    )
+    second = SimpleNamespace(
+        kv_cache_dtype="oscar_mla_int2",
+        oscar_write_calls=7,
+        oscar_demotion_calls=2,
+        oscar_read_calls=6,
+    )
+    native = SimpleNamespace(
+        kv_cache_dtype="auto",
+        oscar_write_calls=100,
+        oscar_demotion_calls=100,
+        oscar_read_calls=100,
+    )
+    model = SimpleNamespace(
+        modules=lambda: (
+            SimpleNamespace(impl=first),
+            SimpleNamespace(impl=second),
+            SimpleNamespace(impl=native),
+            SimpleNamespace(),
+        )
+    )
+
+    impls = _find_oscar_mla_impls(model)
+    counts = _collect_oscar_mla_call_counts(impls)
+
+    assert impls == (first, second)
+    assert counts == {
+        "layers": 2,
+        "store_total": 14,
+        "store_min": 7,
+        "store_max": 7,
+        "demotion_total": 5,
+        "demotion_min": 2,
+        "demotion_max": 3,
+        "read_total": 12,
+        "read_min": 6,
+        "read_max": 6,
+    }
 
 
 def test_unified_update_handles_empty_oscar_cache(monkeypatch) -> None:

@@ -122,6 +122,15 @@ def test_cache_config_matches_three_pool_plan_exactly() -> None:
     assert config.num_blocks == expected.num_blocks
     assert config.oscar_mla_history_pages == expected.history_pages
     assert config.oscar_mla_max_num_seqs == max_num_seqs
+    assert expected.fixed_prefix_slots == 1024
+    assert expected.fixed_recent_slots == 4096
+    assert expected.history_slots == expected.history_pages * 16
+    assert expected.theoretical_history_compression_ratio == pytest.approx(6.4)
+    assert expected.padded_history_compression_ratio == pytest.approx(6.4)
+    assert expected.native_logical_token_slots == 162256
+    assert expected.allocated_capacity_ratio == pytest.approx(
+        expected.logical_token_slots / 162256
+    )
     assert len(config.kv_cache_tensors) == len(layer_names)
     assert sum(tensor.size for tensor in config.kv_cache_tensors) == (
         expected.allocated_bytes

@@ -224,11 +224,28 @@ class MLARuntimeCachePlan:
         return self.num_blocks
 
     @property
+    def fixed_prefix_slots(self) -> int:
+        return self.max_num_seqs * self.geometry.prefix_tokens
+
+    @property
+    def fixed_recent_slots(self) -> int:
+        return self.max_num_seqs * self.geometry.recent_tokens
+
+    @property
+    def history_slots(self) -> int:
+        return self.history_pages * self.geometry.block_size
+
+    @property
+    def fixed_prefix_bytes(self) -> int:
+        return self.fixed_prefix_slots * self.geometry.bf16_token_bytes
+
+    @property
+    def fixed_recent_bytes(self) -> int:
+        return self.fixed_recent_slots * self.geometry.bf16_token_bytes
+
+    @property
     def fixed_bf16_bytes(self) -> int:
-        slots = self.max_num_seqs * (
-            self.geometry.prefix_tokens + self.geometry.recent_tokens
-        )
-        return slots * self.geometry.bf16_token_bytes
+        return self.fixed_prefix_bytes + self.fixed_recent_bytes
 
     @property
     def history_bytes(self) -> int:
@@ -255,6 +272,39 @@ class MLARuntimeCachePlan:
             + self.rope_bytes
             + self.auxiliary_bytes
         )
+
+    @property
+    def theoretical_history_compression_ratio(self) -> float:
+        return self.geometry.bf16_token_bytes / self.geometry.history_token_bytes
+
+    @property
+    def padded_history_compression_ratio(self) -> float:
+        return self.geometry.bf16_page_bytes / self.geometry.history_page_bytes
+
+    @property
+    def native_page_bytes(self) -> int:
+        return (
+            self.geometry.bf16_page_bytes
+            + self.geometry.num_layers
+            * self.geometry.block_size
+            * self.rope_bytes_per_layer_token
+            + self.auxiliary_bytes_per_block
+        )
+
+    @property
+    def native_num_blocks(self) -> int:
+        return self.total_memory_bytes // self.native_page_bytes
+
+    @property
+    def native_logical_token_slots(self) -> int:
+        usable_blocks = max(0, self.native_num_blocks - 1)
+        return usable_blocks * self.geometry.block_size
+
+    @property
+    def allocated_capacity_ratio(self) -> float:
+        if self.native_logical_token_slots == 0:
+            return float("inf")
+        return self.logical_token_slots / self.native_logical_token_slots
 
 
 def plan_mla_runtime_cache(
