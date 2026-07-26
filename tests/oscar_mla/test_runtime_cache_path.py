@@ -102,6 +102,23 @@ def test_unified_update_handles_empty_oscar_cache(monkeypatch) -> None:
     assert result.numel() == 0
 
 
+def test_unified_update_handles_empty_oscar_profile_tensor(monkeypatch) -> None:
+    layer = SimpleNamespace(kv_cache=torch.empty(0, dtype=torch.int8))
+    context = SimpleNamespace(no_compile_layers={"layer": layer})
+    monkeypatch.setattr(mla_attention, "_resolve_layer_name", lambda name: name)
+    monkeypatch.setattr(mla_attention, "get_forward_context", lambda: context)
+
+    result = mla_attention.unified_mla_kv_cache_update(
+        torch.empty(0, 512),
+        torch.empty(0, 1, 64),
+        "layer",
+        "oscar_mla_int2",
+        torch.tensor(1.0),
+    )
+
+    assert result.numel() == 0
+
+
 def test_runtime_write_demotes_before_overwriting_recent(monkeypatch) -> None:
     events: list[tuple[str, object]] = []
     monkeypatch.setattr(

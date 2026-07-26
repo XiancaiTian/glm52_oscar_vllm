@@ -283,6 +283,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     OscarMLAAttentionSpec,
 )
+from vllm.v1.worker.oscar_mla_cache import OscarMLACacheTensors
 
 logger = init_logger(__name__)
 
@@ -1098,7 +1099,9 @@ def unified_mla_kv_cache_update(
 
     # This needs to run even when we don't have metadata yet, so that the op
     # is correctly captured.
-    cache_storage = kv_cache.raw if kv_cache_dtype == "oscar_mla_int2" else kv_cache
+    cache_storage = (
+        kv_cache.raw if isinstance(kv_cache, OscarMLACacheTensors) else kv_cache
+    )
     if cache_storage.numel() == 0:
         # Can't update an empty KV cache.
         return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
