@@ -188,18 +188,28 @@ def test_bf16_store_uses_final_partition_and_ring_addresses() -> None:
     hp_rows = torch.zeros_like(positions)
 
     oscar_mla_store_bf16(
-        latent,
+        latent[2:4],
         prefix,
         recent,
-        positions,
-        final_lens,
-        hp_rows,
+        positions[2:4],
+        final_lens[2:4],
+        hp_rows[2:4],
+    )
+    assert torch.isnan(recent[0, 0]).all()
+    assert torch.isnan(recent[0, 1]).all()
+
+    stored_rows = torch.tensor([0, 1, 4, 5, 6], device=device)
+    oscar_mla_store_bf16(
+        latent[stored_rows],
+        prefix,
+        recent,
+        positions[stored_rows],
+        final_lens[stored_rows],
+        hp_rows[stored_rows],
     )
 
     torch.testing.assert_close(prefix[0, 0], latent[0].bfloat16())
     torch.testing.assert_close(prefix[0, 63], latent[1].bfloat16())
-    assert torch.isnan(recent[0, 0]).all()
-    torch.testing.assert_close(recent[0, 1], latent[3].bfloat16())
     torch.testing.assert_close(recent[0, 255], latent[4].bfloat16())
     torch.testing.assert_close(recent[0, 0], latent[5].bfloat16())
     torch.testing.assert_close(recent[0, 1], latent[6].bfloat16())
