@@ -71,6 +71,15 @@ def test_artifact_round_trip_and_hashes(tmp_path) -> None:
         )
 
 
+def test_artifact_validation_ignores_default_device(tmp_path) -> None:
+    write_rotation_artifact(tmp_path, _metadata(), _rotations())
+
+    with torch.device("meta"):
+        loaded = load_rotation_artifact(tmp_path, expectation=_expectation())
+
+    assert all(rotation.device.type == "cpu" for rotation in loaded.rotations.values())
+
+
 def test_artifact_rejects_missing_wrong_shape_and_nonorthogonal_layers(
     tmp_path,
 ) -> None:

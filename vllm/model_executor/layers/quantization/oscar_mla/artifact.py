@@ -237,7 +237,11 @@ def _validate_rotations(
         missing = sorted(expected_layers - set(rotations))
         extra = sorted(set(rotations) - expected_layers)
         raise ValueError(f"rotation layers mismatch; missing={missing}, extra={extra}")
-    identity = torch.eye(metadata.latent_rank, dtype=torch.float64)
+    identity = torch.eye(
+        metadata.latent_rank,
+        dtype=torch.float64,
+        device="cpu",
+    )
     normalized: dict[int, torch.Tensor] = {}
     for layer in range(metadata.num_layers):
         rotation = rotations[layer]
