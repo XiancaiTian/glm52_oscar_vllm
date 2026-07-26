@@ -321,7 +321,7 @@ def test_chunked_and_one_shot_final_partitions_match() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    rotation = _rotation(dim, device=device).T
+    rotation = _rotation(dim, device=device).contiguous().T
     assert not rotation.is_contiguous()
     positions = torch.arange(final_length, dtype=torch.int32, device=device)
     hp_rows = torch.zeros(final_length, dtype=torch.int32, device=device)
