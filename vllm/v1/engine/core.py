@@ -564,19 +564,13 @@ class EngineCore:
             # we can compute the grammar bitmask for the deferred request.
             if self.use_spec_decode:
                 draft_token_ids = self.model_executor.take_draft_token_ids()
-                if draft_token_ids is None:
-                    logger.warning(
-                        "Missing draft token ids for deferred structured "
-                        "output under speculative decoding; continue without "
-                        "draft-token grammar filtering."
-                    )
-                else:
-                    # Update the draft token ids in the scheduler output to
-                    # filter out the invalid spec tokens, which will be padded
-                    # with -1 and skipped by the grammar bitmask computation.
-                    self.scheduler.update_draft_token_ids_in_output(
-                        draft_token_ids, deferred_scheduler_output
-                    )
+                assert draft_token_ids is not None
+                # Update the draft token ids in the scheduler output to
+                # filter out the invalid spec tokens, which will be padded
+                # with -1 and skipped by the grammar bitmask computation.
+                self.scheduler.update_draft_token_ids_in_output(
+                    draft_token_ids, deferred_scheduler_output
+                )
             # We now have the tokens needed to compute the bitmask for the
             # deferred request. Get the bitmask and call sample tokens.
             grammar_output = self.scheduler.get_grammar_bitmask(
