@@ -4,6 +4,7 @@
 or FlashInfer MLA Sparse (SM100+), e.g. SM80 (A100) and SM121 (GB10)."""
 
 import os
+import time
 from typing import ClassVar
 
 import torch
@@ -88,6 +89,8 @@ _FORCE_PREFIX_MASK_DECODE_MAX_TOKENS = _env_int(
     "VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE_MAX_TOKENS",
     4,
 )
+_PREFILL_SHAPE_BUCKET_TRACE = _env_flag("VLLM_PREFILL_SHAPE_BUCKET_TRACE")
+logger = init_logger(__name__)
 
 
 class TritonMLASparseMetadataBuilder(XPUMLASparseMetadataBuilder):
@@ -354,6 +357,52 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         q_nope = q[0] if isinstance(q, tuple) else q
         num_tokens = q_nope.shape[0]
+        trace_enabled = _PREFILL_SHAPE_BUCKET_TRACE and num_tokens > 1
+        if trace_enabled:
+            logger.info(
+                "PREFILL_SHAPE_BUCKET_TRITON_MLA q=%s topk=%s "
+                "num_tokens=%s meta_tokens=%s max_query=%s max_seq=%s "
+                "num_prefills=%s num_decodes=%s full_topk_start=%s base_seq_len=%s",
+                tuple(q_nope.shape),
+                tuple(topk_indices.shape),
+                num_tokens,
+                getattr(attn_metadata, "num_actual_tokens", None),
+                getattr(attn_metadata, "max_query_len", None),
+                getattr(attn_metadata, "max_seq_len", None),
+                getattr(attn_metadata, "num_prefills", None),
+                getattr(attn_metadata, "num_decodes", None),
+                getattr(attn_metadata, "full_topk_start", None),
+                getattr(attn_metadata, "base_seq_len", None),
+            )
+
+        def _trace_sync() -> None:
+            if trace_enabled and q_nope.device.type == "cuda":
+                torch.cuda.synchronize(q_nope.device)
+
+        def _sparse_mla_call(label: str, *args, **kwargs):
+            start = 0.0
+            if trace_enabled:
+                _trace_sync()
+                start = time.perf_counter()
+            result = triton_sparse_mla_attention(*args, **kwargs)
+            if trace_enabled:
+                _trace_sync()
+                logger.info(
+                    "PREFILL_SHAPE_BUCKET_TRITON_MLA_ATTENTION_TIMING "
+                    "label=%s q=%s topk=%s num_tokens=%s max_query=%s "
+                    "max_seq=%s num_reqs=%s return_lse=%s ms=%.3f",
+                    label,
+                    tuple(q_nope.shape),
+                    tuple(topk_indices.shape),
+                    num_tokens,
+                    getattr(attn_metadata, "max_query_len", None),
+                    getattr(attn_metadata, "max_seq_len", None),
+                    getattr(attn_metadata, "num_reqs", None),
+                    return_lse,
+                    (time.perf_counter() - start) * 1000.0,
+                )
+            return result
+
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
@@ -371,6 +420,10 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 "block_size": attn_metadata.block_size,
             }
         else:
+            convert_start = 0.0
+            if trace_enabled:
+                _trace_sync()
+                convert_start = time.perf_counter()
             topk_indices = triton_convert_req_index_to_global_index(
                 attn_metadata.req_id_per_token,
                 attn_metadata.block_table,
@@ -379,6 +432,21 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
                 BLOCK_N=_REQ_TO_GLOBAL_BLOCK_N,
             ).view(num_tokens, 1, -1)
+            if trace_enabled:
+                _trace_sync()
+                logger.info(
+                    "PREFILL_SHAPE_BUCKET_TRITON_MLA_CONVERT_TIMING "
+                    "q=%s topk=%s num_tokens=%s max_query=%s max_seq=%s "
+                    "num_reqs=%s block_n=%s ms=%.3f",
+                    tuple(q_nope.shape),
+                    tuple(topk_indices.shape),
+                    num_tokens,
+                    getattr(attn_metadata, "max_query_len", None),
+                    getattr(attn_metadata, "max_seq_len", None),
+                    getattr(attn_metadata, "num_reqs", None),
+                    _REQ_TO_GLOBAL_BLOCK_N,
+                    (time.perf_counter() - convert_start) * 1000.0,
+                )
             sparse_kwargs = {}
         out_heads = q_nope.shape[1] if return_lse else self.num_heads
         if (
@@ -391,7 +459,8 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     _FORCE_PREFIX_MASK_DECODE
                     and num_tokens <= _FORCE_PREFIX_MASK_DECODE_MAX_TOKENS
                 ):
-                    result = triton_sparse_mla_attention(
+                    result = _sparse_mla_call(
+                        "dynamic_prefix_mask_decode",
                         q,
                         kv_c_and_k_pe_cache,
                         topk_indices,
@@ -405,7 +474,8 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                         output, lse = result
                         return output[:, :out_heads, :], lse[:, :out_heads]
                     return result[:, :out_heads, :]
-                result = triton_sparse_mla_attention(
+                result = _sparse_mla_call(
+                    "dynamic_assume_valid",
                     q,
                     kv_c_and_k_pe_cache,
                     topk_indices,
@@ -420,7 +490,8 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     return output[:, :out_heads, :], lse[:, :out_heads]
                 return result[:, :out_heads, :]
             if full_topk_start < num_tokens:
-                result = triton_sparse_mla_attention(
+                result = _sparse_mla_call(
+                    "dynamic_prefix_mask",
                     q,
                     kv_c_and_k_pe_cache,
                     topk_indices,
@@ -440,7 +511,8 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         ):
             full_topk_start = attn_metadata.full_topk_start
             if full_topk_start <= 0:
-                result = triton_sparse_mla_attention(
+                result = _sparse_mla_call(
+                    "split_assume_valid",
                     q,
                     kv_c_and_k_pe_cache,
                     topk_indices,
@@ -463,7 +535,8 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 # This split shortcut is only used in the non-DCP path; DCP
                 # needs all gathered heads plus LSE for the downstream combine.
                 if return_lse:
-                    result = triton_sparse_mla_attention(
+                    result = _sparse_mla_call(
+                        "split_return_lse_prefix_mask",
                         q,
                         kv_c_and_k_pe_cache,
                         topk_indices,
@@ -475,7 +548,8 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     )
                     output, lse = result
                     return output[:, :out_heads, :], lse[:, :out_heads]
-                triton_sparse_mla_attention(
+                _sparse_mla_call(
+                    "split_prefix_mask",
                     self._slice_q(q, slice(None, full_topk_start)),
                     kv_c_and_k_pe_cache,
                     topk_indices[:full_topk_start],
@@ -483,7 +557,8 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     sm_count=self._sm_count,
                     out=output[:full_topk_start],
                 )
-                triton_sparse_mla_attention(
+                _sparse_mla_call(
+                    "split_assume_valid_tail",
                     self._slice_q(q, slice(full_topk_start, None)),
                     kv_c_and_k_pe_cache,
                     topk_indices[full_topk_start:],
@@ -493,7 +568,8 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     assume_valid_indices=True,
                 )
                 return output[:, :out_heads, :]
-        result = triton_sparse_mla_attention(
+        result = _sparse_mla_call(
+            "default",
             q,
             kv_c_and_k_pe_cache,
             topk_indices,
