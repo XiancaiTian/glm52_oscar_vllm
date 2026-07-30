@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
@@ -322,6 +325,70 @@ def test_runtime_write_directly_stores_current_history(monkeypatch) -> None:
     assert captured["latent"].shape == (17, 512)
     assert captured["pages"].tolist() == [9] * 16 + [11]
     assert captured["offsets"].tolist() == list(range(16)) + [0]
+
+
+def test_runtime_decode_skips_current_history_selection(monkeypatch) -> None:
+    captured: dict[str, torch.Tensor] = {}
+    monkeypatch.setattr(triton_mla_sparse, "oscar_mla_store_rope", lambda *args: None)
+    monkeypatch.setattr(
+        triton_mla_sparse,
+        "oscar_mla_demote_recent",
+        lambda *args, **kwargs: None,
+    )
+
+    def _unexpected_history(*args, **kwargs) -> None:
+        raise AssertionError("decode token cannot belong to current history")
+
+    monkeypatch.setattr(
+        triton_mla_sparse,
+        "oscar_mla_rotate_quantize_store",
+        _unexpected_history,
+    )
+
+    def _capture_bf16(*args) -> None:
+        captured["positions"] = args[3]
+        captured["seq_lens"] = args[4]
+        captured["hp_rows"] = args[5]
+
+    monkeypatch.setattr(
+        triton_mla_sparse,
+        "oscar_mla_store_bf16",
+        _capture_bf16,
+    )
+    metadata = _metadata(
+        query_start=336,
+        seq_len=337,
+        num_tokens=1,
+        demote=True,
+    )
+    metadata.num_reqs = 2
+    metadata.num_actual_tokens = 2
+    metadata.query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
+    metadata.slot_mapping = torch.tensor([336, 599], dtype=torch.int32)
+    metadata.req_id_per_token = torch.tensor([0, 1], dtype=torch.int32)
+    metadata.seq_lens = torch.tensor([337, 600], dtype=torch.int32)
+    assert metadata.oscar_mla is not None
+    metadata.oscar_mla = replace(
+        metadata.oscar_mla,
+        hp_rows=torch.tensor([2, 7], dtype=torch.int32),
+        history_page_table=torch.tensor(
+            [[9, 11], [4, 5]],
+            dtype=torch.int32,
+        ),
+    )
+
+    _impl().do_oscar_kv_cache_update(
+        torch.randn(2, 512, dtype=torch.bfloat16),
+        torch.randn(2, 1, 64, dtype=torch.bfloat16),
+        _cache(),
+        metadata,
+        torch.eye(512),
+        clip_ratio=0.96,
+    )
+
+    assert captured["positions"].tolist() == [336, 599]
+    assert captured["seq_lens"].tolist() == [337, 600]
+    assert captured["hp_rows"].tolist() == [2, 7]
 
 
 def test_runtime_read_uses_local_dsa_ids_and_three_pool_cache(monkeypatch) -> None:

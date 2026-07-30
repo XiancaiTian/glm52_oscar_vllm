@@ -82,9 +82,7 @@ _ASSUME_VALID_AFTER_TOPK_NOMASK = _env_flag(
     "VLLM_SPARSE_MLA_ASSUME_VALID_AFTER_TOPK_NOMASK"
 )
 _SPARSE_MLA_WARMUP_NUM_TOKENS = os.getenv("VLLM_SPARSE_MLA_WARMUP_NUM_TOKENS")
-_FORCE_PREFIX_MASK_DECODE = _env_flag(
-    "VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE"
-)
+_FORCE_PREFIX_MASK_DECODE = _env_flag("VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE")
 _FORCE_PREFIX_MASK_DECODE_MAX_TOKENS = _env_int(
     "VLLM_SPARSE_MLA_FORCE_PREFIX_MASK_DECODE_MAX_TOKENS",
     4,
@@ -126,6 +124,8 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         attn_metadata: XPUMLASparseMetadata,
         num_tokens: int,
     ) -> torch.Tensor:
+        if attn_metadata.max_query_len == 1 and num_tokens == attn_metadata.num_reqs:
+            return attn_metadata.seq_lens[:num_tokens] - 1
         token_rows = torch.arange(
             num_tokens,
             dtype=torch.int32,
@@ -154,10 +154,21 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         num_tokens = attn_metadata.num_actual_tokens
         latent = kv_c_normed[:num_tokens]
         rope_values = k_pe[:num_tokens]
-        request_indices = attn_metadata.req_id_per_token[:num_tokens].long()
-        query_positions = self._oscar_query_positions(attn_metadata, num_tokens)
-        final_seq_lens = attn_metadata.seq_lens[request_indices]
-        token_hp_rows = oscar.hp_rows[request_indices]
+        is_decode = (
+            attn_metadata.max_query_len == 1 and num_tokens == attn_metadata.num_reqs
+        )
+        if is_decode:
+            query_positions = attn_metadata.seq_lens[:num_tokens] - 1
+            final_seq_lens = attn_metadata.seq_lens[:num_tokens]
+            token_hp_rows = oscar.hp_rows[:num_tokens]
+        else:
+            request_indices = attn_metadata.req_id_per_token[:num_tokens].long()
+            query_positions = self._oscar_query_positions(
+                attn_metadata,
+                num_tokens,
+            )
+            final_seq_lens = attn_metadata.seq_lens[request_indices]
+            token_hp_rows = oscar.hp_rows[request_indices]
 
         oscar_mla_store_rope(
             rope_values,
@@ -171,9 +182,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     "OSCAR MLA recent-to-INT2 demotion active; first batch=%d tokens",
                     oscar.demotion_positions.numel(),
                 )
-            demotion_hp_rows = oscar.hp_rows[
-                oscar.demotion_request_indices.long()
-            ]
+            demotion_hp_rows = oscar.hp_rows[oscar.demotion_request_indices.long()]
             oscar_mla_demote_recent(
                 kv_cache.recent,
                 rotation,
@@ -189,37 +198,37 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             )
             self.oscar_demotion_calls += 1
 
-        history_end = torch.maximum(
-            torch.full_like(final_seq_lens, kv_cache.prefix.shape[1]),
-            final_seq_lens - kv_cache.recent.shape[1],
-        )
-        current_history = (
-            (query_positions >= kv_cache.prefix.shape[1])
-            & (query_positions < history_end)
-        )
-        history_positions = query_positions[current_history]
-        history_requests = request_indices[current_history]
-        history_indices = history_positions - kv_cache.prefix.shape[1]
-        logical_pages = torch.div(
-            history_indices,
-            kv_cache.history_data.shape[1],
-            rounding_mode="floor",
-        )
-        page_offsets = history_indices % kv_cache.history_data.shape[1]
-        page_ids = oscar.history_page_table[
-            history_requests,
-            logical_pages.long(),
-        ]
-        oscar_mla_rotate_quantize_store(
-            latent[current_history],
-            rotation,
-            kv_cache.history_data,
-            kv_cache.history_scale,
-            kv_cache.history_zero,
-            page_ids,
-            page_offsets,
-            clip_ratio=clip_ratio,
-        )
+        if not is_decode:
+            history_end = torch.maximum(
+                torch.full_like(final_seq_lens, kv_cache.prefix.shape[1]),
+                final_seq_lens - kv_cache.recent.shape[1],
+            )
+            current_history = (query_positions >= kv_cache.prefix.shape[1]) & (
+                query_positions < history_end
+            )
+            history_positions = query_positions[current_history]
+            history_requests = request_indices[current_history]
+            history_indices = history_positions - kv_cache.prefix.shape[1]
+            logical_pages = torch.div(
+                history_indices,
+                kv_cache.history_data.shape[1],
+                rounding_mode="floor",
+            )
+            page_offsets = history_indices % kv_cache.history_data.shape[1]
+            page_ids = oscar.history_page_table[
+                history_requests,
+                logical_pages.long(),
+            ]
+            oscar_mla_rotate_quantize_store(
+                latent[current_history],
+                rotation,
+                kv_cache.history_data,
+                kv_cache.history_scale,
+                kv_cache.history_zero,
+                page_ids,
+                page_offsets,
+                clip_ratio=clip_ratio,
+            )
 
         oscar_mla_store_bf16(
             latent,
@@ -409,8 +418,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         use_fused_req_to_global = (
             _FUSED_REQ_TO_GLOBAL
             and attn_metadata.full_topk_start <= 0
-            and num_tokens
-            <= _FUSED_REQ_TO_GLOBAL_MAX_TOKENS
+            and num_tokens <= _FUSED_REQ_TO_GLOBAL_MAX_TOKENS
         )
         if use_fused_req_to_global:
             topk_indices = topk_indices.view(num_tokens, 1, -1)
@@ -449,10 +457,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 )
             sparse_kwargs = {}
         out_heads = q_nope.shape[1] if return_lse else self.num_heads
-        if (
-            _ASSUME_VALID_DYNAMIC
-            and attn_metadata.num_reqs == 1
-        ):
+        if _ASSUME_VALID_DYNAMIC and attn_metadata.num_reqs == 1:
             full_topk_start = attn_metadata.full_topk_start
             if full_topk_start <= 0:
                 if (
@@ -505,10 +510,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     output, lse = result
                     return output[:, :out_heads, :], lse[:, :out_heads]
                 return result[:, :out_heads, :]
-        if (
-            _ASSUME_VALID_SPLIT
-            and attn_metadata.num_reqs == 1
-        ):
+        if _ASSUME_VALID_SPLIT and attn_metadata.num_reqs == 1:
             full_topk_start = attn_metadata.full_topk_start
             if full_topk_start <= 0:
                 result = _sparse_mla_call(
@@ -633,9 +635,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             self.oscar_read_calls += 1
             output = output.to(q_nope.dtype)
             return (
-                (output, lse)
-                if self.need_to_return_lse_for_decode
-                else (output, None)
+                (output, lse) if self.need_to_return_lse_for_decode else (output, None)
             )
         if is_quantized_kv_cache(self.kv_cache_dtype):
             raise NotImplementedError("FP8 kv is not supported with MLA Sparse yet")
