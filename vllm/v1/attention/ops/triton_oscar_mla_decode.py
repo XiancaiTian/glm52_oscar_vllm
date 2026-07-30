@@ -1065,7 +1065,7 @@ def _oscar_mla_sparse_attention(
         block_r=triton.next_power_of_2(rope.shape[2]),
         **stage1_extra,
         num_warps=4,
-        num_stages=2 if group_prefill_heads and num_splits == 1 else 1,
+        num_stages=1,
     )
 
     merged_shape = (num_queries, num_heads, latent_rank)
