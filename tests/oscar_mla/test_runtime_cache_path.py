@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 
 import torch
 
@@ -392,12 +393,13 @@ def test_runtime_decode_skips_current_history_selection(monkeypatch) -> None:
 
 
 def test_runtime_read_uses_local_dsa_ids_and_three_pool_cache(monkeypatch) -> None:
-    captured: dict[str, torch.Tensor] = {}
+    captured: dict[str, Any] = {}
 
     def _read(*args, **kwargs):
         captured["selected"] = args[2]
         captured["query_positions"] = args[4]
         captured["block_table"] = args[8]
+        captured["num_splits"] = kwargs["num_splits"]
         return torch.ones(1, 2, 512), torch.zeros(1, 2)
 
     monkeypatch.setattr(triton_mla_sparse, "oscar_mla_sparse_prefill", _read)
@@ -427,11 +429,12 @@ def test_runtime_read_uses_local_dsa_ids_and_three_pool_cache(monkeypatch) -> No
     assert captured["selected"].tolist() == [[0, 64, 320]]
     assert captured["query_positions"].tolist() == [320]
     assert captured["block_table"] is metadata.block_table
+    assert captured["num_splits"] == 16
     assert impl.oscar_read_calls == 1
 
 
 def test_runtime_read_maps_multiple_requests_to_local_positions(monkeypatch) -> None:
-    captured: dict[str, torch.Tensor] = {}
+    captured: dict[str, Any] = {}
 
     def _read(*args, **kwargs):
         captured["selected"] = args[2]
@@ -440,6 +443,7 @@ def test_runtime_read_maps_multiple_requests_to_local_positions(monkeypatch) -> 
         captured["block_table"] = args[8]
         captured["history_page_table"] = args[12]
         captured["hp_rows"] = args[13]
+        captured["num_splits"] = kwargs["num_splits"]
         return torch.ones(3, 2, 512), torch.zeros(3, 2)
 
     monkeypatch.setattr(triton_mla_sparse, "oscar_mla_sparse_prefill", _read)
@@ -493,3 +497,45 @@ def test_runtime_read_maps_multiple_requests_to_local_positions(monkeypatch) -> 
     assert captured["block_table"] is metadata.block_table
     assert captured["history_page_table"] is oscar.history_page_table
     assert captured["hp_rows"] is oscar.hp_rows
+    assert captured["num_splits"] == 1
+
+
+def test_runtime_prefill_crops_invalid_topk_tail(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def _read(*args, **kwargs):
+        captured["selected"] = args[2]
+        captured["num_splits"] = kwargs["num_splits"]
+        return torch.ones(3, 2, 512), torch.zeros(3, 2)
+
+    monkeypatch.setattr(triton_mla_sparse, "oscar_mla_sparse_prefill", _read)
+    metadata = _metadata(
+        query_start=0,
+        seq_len=3,
+        num_tokens=3,
+        demote=False,
+    )
+    metadata.topk_tokens = 8
+    impl = _impl()
+    impl.kv_cache_dtype = "oscar_mla_int2"
+    impl.softmax_scale = 576**-0.5
+    impl.topk_indices_buffer = torch.arange(
+        24,
+        dtype=torch.int32,
+    ).reshape(3, 8)
+
+    impl.forward_mqa(
+        (
+            torch.zeros(3, 2, 512, dtype=torch.bfloat16),
+            torch.zeros(3, 2, 64, dtype=torch.bfloat16),
+        ),
+        _cache(),
+        metadata,
+        SimpleNamespace(_oscar_rotation=torch.eye(512)),
+    )
+
+    selected = captured["selected"]
+    assert isinstance(selected, torch.Tensor)
+    assert selected.shape == (3, 3)
+    assert selected.tolist() == impl.topk_indices_buffer[:, :3].tolist()
+    assert captured["num_splits"] == 1

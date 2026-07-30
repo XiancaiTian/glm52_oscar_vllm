@@ -605,6 +605,13 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             q_nope, q_pe = q
             num_actual_toks = q_nope.shape[0]
             assert self.topk_indices_buffer is not None
+            is_decode = (
+                attn_metadata.max_query_len == 1
+                and num_actual_toks == attn_metadata.num_reqs
+            )
+            topk_width = attn_metadata.topk_tokens
+            if not is_decode:
+                topk_width = min(topk_width, attn_metadata.max_seq_len)
             query_positions = self._oscar_query_positions(
                 attn_metadata,
                 num_actual_toks,
@@ -612,7 +619,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             output, lse = oscar_mla_sparse_prefill(
                 q_nope,
                 q_pe,
-                self.topk_indices_buffer[:num_actual_toks],
+                self.topk_indices_buffer[:num_actual_toks, :topk_width],
                 attn_metadata.req_id_per_token[:num_actual_toks],
                 query_positions,
                 kv_c_and_k_pe_cache.prefix,
@@ -627,6 +634,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 attn_metadata.seq_lens,
                 layer._oscar_rotation,
                 attention_scale=self.softmax_scale,
+                num_splits=16 if is_decode else 1,
             )
             if self.oscar_read_calls == 0:
                 logger.info_once(
