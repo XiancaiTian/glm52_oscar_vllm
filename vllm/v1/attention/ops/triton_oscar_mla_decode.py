@@ -415,7 +415,7 @@ def _mixed_sparse_prefill_stage1(
         + dims[None, :] * stride_query_d,
         mask=head_mask[:, None] & dim_mask[None, :],
         other=0.0,
-    ).to(tl.bfloat16)
+    ).to(tl.float32)
     query_rotated = tl.load(
         query_rotated_ptr
         + query_row * stride_query_rotated_b
@@ -423,7 +423,7 @@ def _mixed_sparse_prefill_stage1(
         + dims[None, :] * stride_query_rotated_d,
         mask=head_mask[:, None] & dim_mask[None, :],
         other=0.0,
-    ).to(tl.bfloat16)
+    ).to(tl.float32)
     rope_dims = tl.arange(0, block_r)
     rope_dim_mask = rope_dims < rope_head_size
     query_rope = tl.load(
@@ -433,7 +433,7 @@ def _mixed_sparse_prefill_stage1(
         + rope_dims[None, :] * stride_query_rope_d,
         mask=head_mask[:, None] & rope_dim_mask[None, :],
         other=0.0,
-    ).to(tl.bfloat16)
+    ).to(tl.float32)
     hp_row = tl.load(hp_rows_ptr + safe_request * stride_hp_rows)
     seq_len = tl.load(seq_lens_ptr + safe_request * stride_seq_lens)
     causal_seq_len = tl.minimum(seq_len, query_position + 1)
@@ -484,7 +484,7 @@ def _mixed_sparse_prefill_stage1(
             is_prefix[None, :],
             prefix_values,
             recent_values,
-        ).to(tl.bfloat16)
+        ).to(tl.float32)
 
         history_indices = tokens - prefix_tokens
         logical_pages = history_indices // history_block_size
@@ -524,7 +524,7 @@ def _mixed_sparse_prefill_stage1(
             mask=dim_mask[:, None] & is_history[None, :],
             other=0.0,
         ).to(tl.float32)
-        history_values = ((quantized - zero) * scale).to(tl.bfloat16)
+        history_values = (quantized - zero) * scale
 
         rope_logical_pages = tokens // rope_block_size
         rope_page_offsets = tokens % rope_block_size
@@ -542,11 +542,15 @@ def _mixed_sparse_prefill_stage1(
             + rope_dims[:, None] * stride_rope_d,
             mask=rope_dim_mask[:, None] & valid[None, :],
             other=0.0,
-        ).to(tl.bfloat16)
+        ).to(tl.float32)
 
-        bf16_scores = tl.dot(query, bf16_values)
-        history_scores = tl.dot(query_rotated, history_values)
-        rope_scores = tl.dot(query_rope, rope_values)
+        bf16_scores = tl.dot(query, bf16_values, input_precision="ieee")
+        history_scores = tl.dot(
+            query_rotated,
+            history_values,
+            input_precision="ieee",
+        )
+        rope_scores = tl.dot(query_rope, rope_values, input_precision="ieee")
         scores = (
             tl.where(
                 is_history[None, :],
@@ -564,10 +568,14 @@ def _mixed_sparse_prefill_stage1(
             probabilities = tl.exp(scores - m_new[:, None])
             probabilities = tl.where(score_mask, probabilities, 0.0)
             bf16_acc = bf16_acc * previous_scale[:, None] + tl.dot(
-                probabilities.to(tl.bfloat16), tl.trans(bf16_values)
+                probabilities,
+                tl.trans(bf16_values),
+                input_precision="ieee",
             )
             history_acc = history_acc * previous_scale[:, None] + tl.dot(
-                probabilities.to(tl.bfloat16), tl.trans(history_values)
+                probabilities,
+                tl.trans(history_values),
+                input_precision="ieee",
             )
             l_prev = l_prev * previous_scale + tl.sum(probabilities, axis=1)
             m_prev = m_new
