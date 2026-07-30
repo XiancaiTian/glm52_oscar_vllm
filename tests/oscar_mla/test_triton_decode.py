@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 import subprocess
 import sys
@@ -10,6 +12,7 @@ from vllm.model_executor.layers.quantization.oscar_mla.reference import (
     mixed_latent_attention_with_lse,
 )
 from vllm.v1.attention.ops.triton_oscar_mla_decode import (
+    _prefill_head_block_size,
     oscar_mla_sparse_decode,
     oscar_mla_sparse_prefill,
 )
@@ -24,6 +27,14 @@ requires_cuda = pytest.mark.skipif(
     not RUN_CUDA_TESTS or not torch.cuda.is_available(),
     reason="set VLLM_OSCAR_RUN_CUDA_TESTS=1 on an authorized idle GPU",
 )
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "expected"),
+    [(1, 16), (8, 16), (16, 16), (17, 32), (32, 32)],
+)
+def test_prefill_head_block_size(num_heads: int, expected: int) -> None:
+    assert _prefill_head_block_size(num_heads) == expected
 
 
 def test_triton_interpreter_smoke() -> None:
@@ -567,8 +578,10 @@ def test_sparse_decode_isolates_batched_requests(batch_size: int) -> None:
 
 @requires_cuda
 @pytest.mark.parametrize("num_queries", [1, 4, 8])
+@pytest.mark.parametrize("num_heads", [1, 8])
 def test_sparse_prefill_is_causal_and_matches_three_pool_oracle(
     num_queries: int,
+    num_heads: int,
 ) -> None:
     device = torch.device("cuda")
     dim = 512
@@ -584,7 +597,7 @@ def test_sparse_prefill_is_causal_and_matches_three_pool_oracle(
     )
     query = torch.randn(
         num_queries,
-        1,
+        num_heads,
         dim,
         generator=generator,
         dtype=torch.bfloat16,
@@ -599,7 +612,7 @@ def test_sparse_prefill_is_causal_and_matches_three_pool_oracle(
     )
     query_rope = torch.randn(
         num_queries,
-        1,
+        num_heads,
         64,
         generator=generator,
         dtype=torch.bfloat16,
@@ -685,7 +698,7 @@ def test_sparse_prefill_is_causal_and_matches_three_pool_oracle(
         zero_index,
         torch.tensor([seq_len], dtype=torch.int32, device=device),
         rotation,
-        num_splits=4,
+        num_splits=1,
     )
 
     expected_rows = []
@@ -716,7 +729,7 @@ def test_sparse_prefill_is_causal_and_matches_three_pool_oracle(
         lse,
         expected,
         expected_lse,
-        label=f"prefill_batch={num_queries}",
+        label=f"prefill_batch={num_queries}_heads={num_heads}",
     )
     assert torch.isfinite(output).all()
     assert torch.isfinite(lse).all()

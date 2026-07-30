@@ -315,6 +315,293 @@ def _mixed_sparse_decode_stage1(
 
 
 @triton.jit
+def _mixed_sparse_prefill_stage1(
+    query_ptr,
+    query_rotated_ptr,
+    query_rope_ptr,
+    selected_tokens_ptr,
+    query_request_indices_ptr,
+    query_positions_ptr,
+    prefix_ptr,
+    recent_ptr,
+    rope_ptr,
+    rope_block_table_ptr,
+    history_data_ptr,
+    history_scale_ptr,
+    history_zero_ptr,
+    history_page_table_ptr,
+    hp_rows_ptr,
+    seq_lens_ptr,
+    mid_bf16_ptr,
+    mid_history_ptr,
+    mid_lse_ptr,
+    stride_query_b: tl.constexpr,
+    stride_query_h: tl.constexpr,
+    stride_query_d: tl.constexpr,
+    stride_query_rotated_b: tl.constexpr,
+    stride_query_rotated_h: tl.constexpr,
+    stride_query_rotated_d: tl.constexpr,
+    stride_query_rope_b: tl.constexpr,
+    stride_query_rope_h: tl.constexpr,
+    stride_query_rope_d: tl.constexpr,
+    stride_selected_b: tl.constexpr,
+    stride_selected_k: tl.constexpr,
+    stride_query_request: tl.constexpr,
+    stride_query_position: tl.constexpr,
+    stride_prefix_row: tl.constexpr,
+    stride_prefix_token: tl.constexpr,
+    stride_prefix_d: tl.constexpr,
+    stride_recent_row: tl.constexpr,
+    stride_recent_token: tl.constexpr,
+    stride_recent_d: tl.constexpr,
+    stride_rope_block: tl.constexpr,
+    stride_rope_token: tl.constexpr,
+    stride_rope_d: tl.constexpr,
+    stride_rope_block_table_b: tl.constexpr,
+    stride_rope_block_table_page: tl.constexpr,
+    stride_data_page: tl.constexpr,
+    stride_data_token: tl.constexpr,
+    stride_data_byte: tl.constexpr,
+    stride_scale_page: tl.constexpr,
+    stride_scale_token: tl.constexpr,
+    stride_scale_group: tl.constexpr,
+    stride_zero_page: tl.constexpr,
+    stride_zero_token: tl.constexpr,
+    stride_zero_group: tl.constexpr,
+    stride_page_table_b: tl.constexpr,
+    stride_page_table_page: tl.constexpr,
+    stride_hp_rows: tl.constexpr,
+    stride_seq_lens: tl.constexpr,
+    stride_mid_b: tl.constexpr,
+    stride_mid_h: tl.constexpr,
+    stride_mid_split: tl.constexpr,
+    stride_mid_d: tl.constexpr,
+    stride_lse_b: tl.constexpr,
+    stride_lse_h: tl.constexpr,
+    stride_lse_split: tl.constexpr,
+    topk: tl.constexpr,
+    prefix_tokens: tl.constexpr,
+    recent_tokens: tl.constexpr,
+    rope_block_size: tl.constexpr,
+    rope_head_size: tl.constexpr,
+    history_block_size: tl.constexpr,
+    latent_rank: tl.constexpr,
+    group_size: tl.constexpr,
+    attention_scale: tl.constexpr,
+    num_requests: tl.constexpr,
+    num_heads: tl.constexpr,
+    block_h: tl.constexpr,
+    block_t: tl.constexpr,
+    block_d: tl.constexpr,
+    block_r: tl.constexpr,
+):
+    query_row = tl.program_id(0)
+    head_group = tl.program_id(1)
+    heads = head_group * block_h + tl.arange(0, block_h)
+    head_mask = heads < num_heads
+    request = tl.load(
+        query_request_indices_ptr + query_row * stride_query_request,
+    )
+    request_valid = (request >= 0) & (request < num_requests)
+    safe_request = tl.where(request_valid, request, 0)
+    query_position = tl.load(query_positions_ptr + query_row * stride_query_position)
+
+    dims = tl.arange(0, block_d)
+    dim_mask = dims < latent_rank
+    query = tl.load(
+        query_ptr
+        + query_row * stride_query_b
+        + heads[:, None] * stride_query_h
+        + dims[None, :] * stride_query_d,
+        mask=head_mask[:, None] & dim_mask[None, :],
+        other=0.0,
+    ).to(tl.bfloat16)
+    query_rotated = tl.load(
+        query_rotated_ptr
+        + query_row * stride_query_rotated_b
+        + heads[:, None] * stride_query_rotated_h
+        + dims[None, :] * stride_query_rotated_d,
+        mask=head_mask[:, None] & dim_mask[None, :],
+        other=0.0,
+    ).to(tl.bfloat16)
+    rope_dims = tl.arange(0, block_r)
+    rope_dim_mask = rope_dims < rope_head_size
+    query_rope = tl.load(
+        query_rope_ptr
+        + query_row * stride_query_rope_b
+        + heads[:, None] * stride_query_rope_h
+        + rope_dims[None, :] * stride_query_rope_d,
+        mask=head_mask[:, None] & rope_dim_mask[None, :],
+        other=0.0,
+    ).to(tl.bfloat16)
+    hp_row = tl.load(hp_rows_ptr + safe_request * stride_hp_rows)
+    seq_len = tl.load(seq_lens_ptr + safe_request * stride_seq_lens)
+    causal_seq_len = tl.minimum(seq_len, query_position + 1)
+    recent_start = tl.maximum(prefix_tokens, seq_len - recent_tokens)
+
+    token_offsets = tl.arange(0, block_t)
+    m_prev = tl.full((block_h,), -float("inf"), dtype=tl.float32)
+    l_prev = tl.zeros((block_h,), dtype=tl.float32)
+    bf16_acc = tl.zeros((block_h, block_d), dtype=tl.float32)
+    history_acc = tl.zeros((block_h, block_d), dtype=tl.float32)
+
+    for tile_start in range(0, topk, block_t):
+        selected_offsets = tile_start + token_offsets
+        selected_mask = selected_offsets < topk
+        tokens = tl.load(
+            selected_tokens_ptr
+            + query_row * stride_selected_b
+            + selected_offsets * stride_selected_k,
+            mask=selected_mask,
+            other=-1,
+        )
+        valid = (
+            selected_mask
+            & request_valid
+            & (query_position >= 0)
+            & (tokens >= 0)
+            & (tokens < causal_seq_len)
+            & (hp_row >= 0)
+        )
+        is_prefix = valid & (tokens < prefix_tokens)
+        is_recent = valid & (tokens >= recent_start)
+        is_history = valid & ~is_prefix & ~is_recent
+
+        prefix_base = hp_row * stride_prefix_row + tokens * stride_prefix_token
+        prefix_values = tl.load(
+            prefix_ptr + prefix_base[None, :] + dims[:, None] * stride_prefix_d,
+            mask=dim_mask[:, None] & is_prefix[None, :],
+            other=0.0,
+        )
+        recent_indices = (tokens - prefix_tokens) % recent_tokens
+        recent_base = hp_row * stride_recent_row + recent_indices * stride_recent_token
+        recent_values = tl.load(
+            recent_ptr + recent_base[None, :] + dims[:, None] * stride_recent_d,
+            mask=dim_mask[:, None] & is_recent[None, :],
+            other=0.0,
+        )
+        bf16_values = tl.where(
+            is_prefix[None, :],
+            prefix_values,
+            recent_values,
+        ).to(tl.bfloat16)
+
+        history_indices = tokens - prefix_tokens
+        logical_pages = history_indices // history_block_size
+        page_offsets = history_indices % history_block_size
+        physical_pages = tl.load(
+            history_page_table_ptr
+            + safe_request * stride_page_table_b
+            + logical_pages * stride_page_table_page,
+            mask=is_history,
+            other=0,
+        )
+        byte_offsets = dims // 4
+        shifts = (dims % 4) * 2
+        data_base = physical_pages * stride_data_page + page_offsets * stride_data_token
+        packed = tl.load(
+            history_data_ptr
+            + data_base[None, :]
+            + byte_offsets[:, None] * stride_data_byte,
+            mask=dim_mask[:, None] & is_history[None, :],
+            other=0,
+        ).to(tl.int32)
+        quantized = ((packed >> shifts[:, None]) & 0x3).to(tl.float32)
+        groups = dims // group_size
+        scale = tl.load(
+            history_scale_ptr
+            + physical_pages[None, :] * stride_scale_page
+            + page_offsets[None, :] * stride_scale_token
+            + groups[:, None] * stride_scale_group,
+            mask=dim_mask[:, None] & is_history[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        zero = tl.load(
+            history_zero_ptr
+            + physical_pages[None, :] * stride_zero_page
+            + page_offsets[None, :] * stride_zero_token
+            + groups[:, None] * stride_zero_group,
+            mask=dim_mask[:, None] & is_history[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        history_values = ((quantized - zero) * scale).to(tl.bfloat16)
+
+        rope_logical_pages = tokens // rope_block_size
+        rope_page_offsets = tokens % rope_block_size
+        rope_physical_pages = tl.load(
+            rope_block_table_ptr
+            + safe_request * stride_rope_block_table_b
+            + rope_logical_pages * stride_rope_block_table_page,
+            mask=valid,
+            other=0,
+        )
+        rope_values = tl.load(
+            rope_ptr
+            + rope_physical_pages[None, :] * stride_rope_block
+            + rope_page_offsets[None, :] * stride_rope_token
+            + rope_dims[:, None] * stride_rope_d,
+            mask=rope_dim_mask[:, None] & valid[None, :],
+            other=0.0,
+        ).to(tl.bfloat16)
+
+        bf16_scores = tl.dot(query, bf16_values)
+        history_scores = tl.dot(query_rotated, history_values)
+        rope_scores = tl.dot(query_rope, rope_values)
+        scores = (
+            tl.where(
+                is_history[None, :],
+                history_scores,
+                bf16_scores,
+            )
+            + rope_scores
+        )
+        scores *= attention_scale
+        score_mask = head_mask[:, None] & valid[None, :]
+        scores = tl.where(score_mask, scores, -float("inf"))
+        if tl.sum(valid.to(tl.int32), axis=0) > 0:
+            m_new = tl.maximum(tl.max(scores, axis=1), m_prev)
+            previous_scale = tl.exp(m_prev - m_new)
+            probabilities = tl.exp(scores - m_new[:, None])
+            probabilities = tl.where(score_mask, probabilities, 0.0)
+            bf16_acc = bf16_acc * previous_scale[:, None] + tl.dot(
+                probabilities.to(tl.bfloat16), tl.trans(bf16_values)
+            )
+            history_acc = history_acc * previous_scale[:, None] + tl.dot(
+                probabilities.to(tl.bfloat16), tl.trans(history_values)
+            )
+            l_prev = l_prev * previous_scale + tl.sum(probabilities, axis=1)
+            m_prev = m_new
+
+    safe_l = tl.where(l_prev > 0.0, l_prev, 1.0)
+    mid_base = (
+        query_row * stride_mid_b
+        + heads[:, None] * stride_mid_h
+        + dims[None, :] * stride_mid_d
+    )
+    output_mask = head_mask[:, None] & dim_mask[None, :]
+    tl.store(
+        mid_bf16_ptr + mid_base,
+        bf16_acc / safe_l[:, None],
+        mask=output_mask,
+    )
+    tl.store(
+        mid_history_ptr + mid_base,
+        history_acc / safe_l[:, None],
+        mask=output_mask,
+    )
+    local_lse = tl.where(
+        l_prev > 0.0,
+        m_prev + tl.log(safe_l),
+        -float("inf"),
+    )
+    tl.store(
+        mid_lse_ptr + query_row * stride_lse_b + heads * stride_lse_h,
+        local_lse,
+        mask=head_mask,
+    )
+
+
+@triton.jit
 def _merge_mixed_splits_kernel(
     mid_bf16_ptr,
     mid_history_ptr,
@@ -580,6 +867,12 @@ def _validate_attention_inputs(
     return num_queries, num_heads, latent_rank, group_size
 
 
+def _prefill_head_block_size(num_heads: int) -> int:
+    if num_heads <= 0:
+        raise ValueError("num_heads must be positive")
+    return 16 if num_heads <= 16 else 32
+
+
 def _oscar_mla_sparse_attention(
     query: torch.Tensor,
     query_rope: torch.Tensor,
@@ -605,6 +898,7 @@ def _oscar_mla_sparse_attention(
     mid_lse: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
     output_lse: torch.Tensor | None = None,
+    group_prefill_heads: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Attend directly to causal DSA-selected tokens across all latent pools."""
     num_queries, num_heads, latent_rank, group_size = _validate_attention_inputs(
@@ -678,7 +972,21 @@ def _oscar_mla_sparse_attention(
     block_d = triton.next_power_of_2(latent_rank)
     block_t = 16
     packed_group_bytes = group_size // 4
-    _mixed_sparse_decode_stage1[(num_queries, num_heads, num_splits)](
+    stage1 = _mixed_sparse_decode_stage1
+    stage1_grid: tuple[int, ...] = (num_queries, num_heads, num_splits)
+    stage1_extra: dict[str, int] = {
+        "num_splits": num_splits,
+        "packed_group_bytes": packed_group_bytes,
+    }
+    if group_prefill_heads and num_splits == 1:
+        block_h = _prefill_head_block_size(num_heads)
+        stage1 = _mixed_sparse_prefill_stage1
+        stage1_grid = (num_queries, triton.cdiv(num_heads, block_h))
+        stage1_extra = {
+            "num_heads": num_heads,
+            "block_h": block_h,
+        }
+    stage1[stage1_grid](
         query,
         query_rotated,
         query_rope,
@@ -742,7 +1050,6 @@ def _oscar_mla_sparse_attention(
         stride_lse_b=mid_lse.stride(0),
         stride_lse_h=mid_lse.stride(1),
         stride_lse_split=mid_lse.stride(2),
-        num_splits=num_splits,
         topk=topk,
         prefix_tokens=prefix.shape[1],
         recent_tokens=recent.shape[1],
@@ -751,14 +1058,14 @@ def _oscar_mla_sparse_attention(
         history_block_size=history_data.shape[1],
         latent_rank=latent_rank,
         group_size=group_size,
-        packed_group_bytes=packed_group_bytes,
         attention_scale=attention_scale,
         num_requests=seq_lens.shape[0],
         block_t=block_t,
         block_d=block_d,
         block_r=triton.next_power_of_2(rope.shape[2]),
+        **stage1_extra,
         num_warps=4,
-        num_stages=1,
+        num_stages=2 if group_prefill_heads and num_splits == 1 else 1,
     )
 
     merged_shape = (num_queries, num_heads, latent_rank)
@@ -956,4 +1263,5 @@ def oscar_mla_sparse_prefill(
         mid_lse=mid_lse,
         output=output,
         output_lse=output_lse,
+        group_prefill_heads=True,
     )
