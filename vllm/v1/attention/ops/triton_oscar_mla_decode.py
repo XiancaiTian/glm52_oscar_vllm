@@ -568,8 +568,9 @@ def _mixed_sparse_prefill_stage1(
             probabilities = tl.exp(scores - m_new[:, None])
             probabilities = tl.where(score_mask, probabilities, 0.0)
             bf16_acc = bf16_acc * previous_scale[:, None] + tl.dot(
-                probabilities.to(tl.bfloat16),
-                tl.trans(bf16_values),
+                probabilities,
+                tl.trans(bf16_values.to(tl.float32)),
+                input_precision="tf32",
             )
             history_acc = history_acc * previous_scale[:, None] + tl.dot(
                 probabilities,
