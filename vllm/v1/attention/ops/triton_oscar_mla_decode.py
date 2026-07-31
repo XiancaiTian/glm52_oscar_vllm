@@ -544,13 +544,13 @@ def _mixed_sparse_prefill_stage1(
             other=0.0,
         ).to(tl.float32)
 
-        bf16_scores = tl.dot(query, bf16_values, input_precision="ieee")
+        bf16_scores = tl.dot(query, bf16_values, input_precision="tf32")
         history_scores = tl.dot(
             query_rotated,
             history_values,
-            input_precision="ieee",
+            input_precision="tf32",
         )
-        rope_scores = tl.dot(query_rope, rope_values, input_precision="ieee")
+        rope_scores = tl.dot(query_rope, rope_values, input_precision="tf32")
         scores = (
             tl.where(
                 is_history[None, :],
@@ -570,12 +570,12 @@ def _mixed_sparse_prefill_stage1(
             bf16_acc = bf16_acc * previous_scale[:, None] + tl.dot(
                 probabilities,
                 tl.trans(bf16_values),
-                input_precision="ieee",
+                input_precision="tf32",
             )
             history_acc = history_acc * previous_scale[:, None] + tl.dot(
                 probabilities,
                 tl.trans(history_values),
-                input_precision="ieee",
+                input_precision="tf32",
             )
             l_prev = l_prev * previous_scale + tl.sum(probabilities, axis=1)
             m_prev = m_new
