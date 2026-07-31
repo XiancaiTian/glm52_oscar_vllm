@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import inspect
 import os
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from vllm.model_executor.layers.quantization.oscar_mla.reference import (
     mixed_latent_attention_with_lse,
 )
 from vllm.v1.attention.ops.triton_oscar_mla_decode import (
+    _mixed_sparse_prefill_stage1,
     _prefill_head_block_size,
     oscar_mla_sparse_decode,
     oscar_mla_sparse_prefill,
@@ -35,6 +37,12 @@ requires_cuda = pytest.mark.skipif(
 )
 def test_prefill_head_block_size(num_heads: int, expected: int) -> None:
     assert _prefill_head_block_size(num_heads) == expected
+
+
+def test_grouped_prefill_uses_causal_runtime_loop_bound() -> None:
+    source = inspect.getsource(_mixed_sparse_prefill_stage1.fn)
+    assert "effective_topk = tl.minimum(topk, causal_seq_len)" in source
+    assert "tl.range(0, effective_topk, block_t)" in source
 
 
 def test_triton_interpreter_smoke() -> None:

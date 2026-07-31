@@ -437,6 +437,7 @@ def _mixed_sparse_prefill_stage1(
     hp_row = tl.load(hp_rows_ptr + safe_request * stride_hp_rows)
     seq_len = tl.load(seq_lens_ptr + safe_request * stride_seq_lens)
     causal_seq_len = tl.minimum(seq_len, query_position + 1)
+    effective_topk = tl.minimum(topk, causal_seq_len)
     recent_start = tl.maximum(prefix_tokens, seq_len - recent_tokens)
 
     token_offsets = tl.arange(0, block_t)
@@ -445,7 +446,7 @@ def _mixed_sparse_prefill_stage1(
     bf16_acc = tl.zeros((block_h, block_d), dtype=tl.float32)
     history_acc = tl.zeros((block_h, block_d), dtype=tl.float32)
 
-    for tile_start in range(0, topk, block_t):
+    for tile_start in tl.range(0, effective_topk, block_t):
         selected_offsets = tile_start + token_offsets
         selected_mask = selected_offsets < topk
         tokens = tl.load(
