@@ -45,6 +45,12 @@ def test_grouped_prefill_uses_causal_runtime_loop_bound() -> None:
     assert "tl.range(0, effective_topk, block_t)" in source
 
 
+def test_grouped_prefill_skips_zero_bf16_tile_dots() -> None:
+    source = inspect.getsource(_mixed_sparse_prefill_stage1.fn)
+    assert "has_bf16 = tl.sum(is_bf16.to(tl.int32), axis=0) > 0" in source
+    assert source.count("if has_bf16:") == 2
+
+
 def test_triton_interpreter_smoke() -> None:
     env = os.environ.copy()
     env.update(

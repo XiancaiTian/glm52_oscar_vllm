@@ -466,7 +466,9 @@ def _mixed_sparse_prefill_stage1(
         )
         is_prefix = valid & (tokens < prefix_tokens)
         is_recent = valid & (tokens >= recent_start)
+        is_bf16 = is_prefix | is_recent
         is_history = valid & ~is_prefix & ~is_recent
+        has_bf16 = tl.sum(is_bf16.to(tl.int32), axis=0) > 0
 
         prefix_base = hp_row * stride_prefix_row + tokens * stride_prefix_token
         prefix_values = tl.load(
@@ -545,7 +547,9 @@ def _mixed_sparse_prefill_stage1(
             other=0.0,
         ).to(tl.bfloat16)
 
-        bf16_scores = tl.dot(query, bf16_values)
+        bf16_scores = tl.zeros((block_h, block_t), dtype=tl.float32)
+        if has_bf16:
+            bf16_scores = tl.dot(query, bf16_values)
         history_scores = tl.dot(
             query_rotated,
             history_values,
@@ -568,11 +572,14 @@ def _mixed_sparse_prefill_stage1(
             previous_scale = tl.exp(m_prev - m_new)
             probabilities = tl.exp(scores - m_new[:, None])
             probabilities = tl.where(score_mask, probabilities, 0.0)
-            bf16_acc = bf16_acc * previous_scale[:, None] + tl.dot(
-                probabilities,
-                tl.trans(bf16_values.to(tl.float32)),
-                input_precision="tf32",
-            )
+            bf16_contribution = tl.zeros((block_h, block_d), dtype=tl.float32)
+            if has_bf16:
+                bf16_contribution = tl.dot(
+                    probabilities,
+                    tl.trans(bf16_values.to(tl.float32)),
+                    input_precision="tf32",
+                )
+            bf16_acc = bf16_acc * previous_scale[:, None] + bf16_contribution
             history_acc = history_acc * previous_scale[:, None] + tl.dot(
                 probabilities,
                 tl.trans(history_values),
