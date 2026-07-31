@@ -757,6 +757,8 @@ def oscar_mla_demote_recent(
     *,
     prefix_tokens: int,
     clip_ratio: float,
+    gathered: torch.Tensor | None = None,
+    rotated: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gather recent rows, rotate them, and store the demoted INT2 history."""
     _require_cuda_tensor(
@@ -782,11 +784,23 @@ def oscar_mla_demote_recent(
             raise ValueError(f"{name} lengths must match")
     _validate_indices(page_ids, page_offsets, num_rows=num_rows)
     latent_rank = recent.shape[2]
-    gathered = torch.empty(
-        (num_rows, latent_rank),
-        dtype=torch.bfloat16,
-        device=recent.device,
-    )
+    if gathered is None:
+        gathered = torch.empty(
+            (num_rows, latent_rank),
+            dtype=torch.bfloat16,
+            device=recent.device,
+        )
+    else:
+        _require_cuda_tensor(
+            gathered,
+            name="gathered",
+            ndim=2,
+            dtype=torch.bfloat16,
+        )
+        if gathered.shape != (num_rows, latent_rank):
+            raise ValueError("gathered demotion scratch shape does not match input")
+        if gathered.device != recent.device:
+            raise ValueError("gathered demotion scratch must share the cache device")
     if num_rows:
         _gather_recent_latent_kernel[(num_rows,)](
             recent,
@@ -815,6 +829,7 @@ def oscar_mla_demote_recent(
         page_ids,
         page_offsets,
         clip_ratio=clip_ratio,
+        rotated=rotated,
     )
 
 

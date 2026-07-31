@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side views and ownership state for OSCAR MLA three-pool caches."""
 
 from __future__ import annotations
@@ -34,9 +36,11 @@ class OscarMLABatchMetadata:
     """GPU metadata for one scheduled batch of three-pool cache operations."""
 
     hp_rows: torch.Tensor
+    decode_positions: torch.Tensor
+    final_seq_lens: torch.Tensor
     history_page_table: torch.Tensor
     previous_seq_lens: torch.Tensor
-    demotion_request_indices: torch.Tensor
+    demotion_hp_rows: torch.Tensor
     demotion_positions: torch.Tensor
     demotion_page_ids: torch.Tensor
     demotion_page_offsets: torch.Tensor
@@ -220,7 +224,7 @@ class OscarMLAWorkerOwnership:
                     device=device,
                 )
 
-        demotion_requests: list[int] = []
+        demotion_hp_rows: list[int] = []
         demotion_positions: list[int] = []
         demotion_pages: list[int] = []
         demotion_offsets: list[int] = []
@@ -237,7 +241,7 @@ class OscarMLAWorkerOwnership:
                 logical_page, page_offset = divmod(history_index, block_size)
                 if logical_page >= len(metadata.history_pages):
                     raise RuntimeError("OSCAR MLA history ownership is incomplete")
-                demotion_requests.append(request_index)
+                demotion_hp_rows.append(metadata.hp_row)
                 demotion_positions.append(position)
                 demotion_pages.append(metadata.history_pages[logical_page])
                 demotion_offsets.append(page_offset)
@@ -247,11 +251,19 @@ class OscarMLAWorkerOwnership:
 
         return OscarMLABatchMetadata(
             hp_rows=_device_tensor(rows + [-1] * (padded_size - len(rows))),
+            decode_positions=_device_tensor(
+                [metadata.logical_length - 1 for metadata in metadata_rows]
+                + [-1] * (padded_size - len(metadata_rows))
+            ),
+            final_seq_lens=_device_tensor(
+                [metadata.logical_length for metadata in metadata_rows]
+                + [0] * (padded_size - len(metadata_rows))
+            ),
             history_page_table=history_page_table,
             previous_seq_lens=_device_tensor(
                 previous_seq_lens + [0] * (padded_size - len(previous_seq_lens))
             ),
-            demotion_request_indices=_device_tensor(demotion_requests),
+            demotion_hp_rows=_device_tensor(demotion_hp_rows),
             demotion_positions=_device_tensor(demotion_positions),
             demotion_page_ids=_device_tensor(demotion_pages),
             demotion_page_offsets=_device_tensor(demotion_offsets),

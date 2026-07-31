@@ -50,13 +50,16 @@ def _metadata(
     )
     oscar = OscarMLABatchMetadata(
         hp_rows=torch.tensor([2], dtype=torch.int32),
+        decode_positions=torch.tensor([seq_len - 1], dtype=torch.int32),
+        final_seq_lens=torch.tensor([seq_len], dtype=torch.int32),
         history_page_table=torch.tensor([[9, 11]], dtype=torch.int32),
         previous_seq_lens=torch.tensor(
             [320 if demote else 0],
             dtype=torch.int32,
         ),
-        demotion_request_indices=torch.zeros(
-            demotion_positions.numel(),
+        demotion_hp_rows=torch.full(
+            (demotion_positions.numel(),),
+            2,
             dtype=torch.int32,
         ),
         demotion_positions=demotion_positions,
@@ -331,10 +334,14 @@ def test_runtime_write_directly_stores_current_history(monkeypatch) -> None:
 def test_runtime_decode_skips_current_history_selection(monkeypatch) -> None:
     captured: dict[str, torch.Tensor] = {}
     monkeypatch.setattr(triton_mla_sparse, "oscar_mla_store_rope", lambda *args: None)
+
+    def _capture_demotion(*args, **kwargs) -> None:
+        captured["demotion_hp_rows"] = args[6]
+
     monkeypatch.setattr(
         triton_mla_sparse,
         "oscar_mla_demote_recent",
-        lambda *args, **kwargs: None,
+        _capture_demotion,
     )
 
     def _unexpected_history(*args, **kwargs) -> None:
@@ -372,11 +379,15 @@ def test_runtime_decode_skips_current_history_selection(monkeypatch) -> None:
     metadata.oscar_mla = replace(
         metadata.oscar_mla,
         hp_rows=torch.tensor([2, 7], dtype=torch.int32),
+        decode_positions=torch.tensor([336, 599], dtype=torch.int32),
+        final_seq_lens=torch.tensor([337, 600], dtype=torch.int32),
+        demotion_hp_rows=torch.tensor([7] * 17, dtype=torch.int32),
         history_page_table=torch.tensor(
             [[9, 11], [4, 5]],
             dtype=torch.int32,
         ),
     )
+    metadata.seq_lens = torch.tensor([999, 999], dtype=torch.int32)
 
     _impl().do_oscar_kv_cache_update(
         torch.randn(2, 512, dtype=torch.bfloat16),
@@ -390,6 +401,24 @@ def test_runtime_decode_skips_current_history_selection(monkeypatch) -> None:
     assert captured["positions"].tolist() == [336, 599]
     assert captured["seq_lens"].tolist() == [337, 600]
     assert captured["hp_rows"].tolist() == [2, 7]
+    assert captured["demotion_hp_rows"].tolist() == [7] * 17
+
+
+def test_runtime_reuses_demotion_scratch_without_growing() -> None:
+    impl = _impl()
+    recent = torch.empty(3, 256, 512, dtype=torch.bfloat16)
+
+    first_gathered, first_rotated = impl._get_oscar_demotion_scratch(recent, 2)
+    second_gathered, second_rotated = impl._get_oscar_demotion_scratch(recent, 1)
+
+    assert first_gathered.shape == (2, 512)
+    assert first_rotated.shape == (2, 512)
+    assert second_gathered.shape == (1, 512)
+    assert second_rotated.shape == (1, 512)
+    assert first_gathered.data_ptr() == second_gathered.data_ptr()
+    assert first_rotated.data_ptr() == second_rotated.data_ptr()
+    assert first_gathered.dtype == torch.bfloat16
+    assert first_rotated.dtype == torch.float32
 
 
 def test_runtime_read_uses_local_dsa_ids_and_three_pool_cache(monkeypatch) -> None:
@@ -450,9 +479,11 @@ def test_runtime_read_maps_multiple_requests_to_local_positions(monkeypatch) -> 
     empty = torch.empty(0, dtype=torch.int32)
     oscar = OscarMLABatchMetadata(
         hp_rows=torch.tensor([2, 1], dtype=torch.int32),
+        decode_positions=torch.tensor([320, 336], dtype=torch.int32),
+        final_seq_lens=torch.tensor([321, 337], dtype=torch.int32),
         history_page_table=torch.tensor([[9, 11], [4, 5]], dtype=torch.int32),
         previous_seq_lens=torch.tensor([320, 335], dtype=torch.int32),
-        demotion_request_indices=empty,
+        demotion_hp_rows=empty,
         demotion_positions=empty,
         demotion_page_ids=empty,
         demotion_page_offsets=empty,

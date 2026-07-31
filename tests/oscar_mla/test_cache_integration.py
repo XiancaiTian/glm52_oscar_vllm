@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
 
 import pytest
@@ -332,9 +334,11 @@ def test_worker_builds_incremental_batch_demotion_metadata() -> None:
     )
 
     assert metadata.hp_rows.tolist() == [2, -1]
+    assert metadata.decode_positions.tolist() == [336, -1]
+    assert metadata.final_seq_lens.tolist() == [337, 0]
     assert metadata.previous_seq_lens.tolist() == [320, 0]
     assert metadata.history_page_table.tolist() == [[9, 11], [0, 0]]
-    assert metadata.demotion_request_indices.tolist() == [0] * 17
+    assert metadata.demotion_hp_rows.tolist() == [2] * 17
     assert metadata.demotion_positions.tolist() == list(range(64, 81))
     assert metadata.demotion_page_ids.tolist() == [9] * 16 + [11]
     assert metadata.demotion_page_offsets.tolist() == list(range(16)) + [0]

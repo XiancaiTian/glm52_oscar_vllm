@@ -112,12 +112,51 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         self.oscar_write_calls = 0
         self.oscar_demotion_calls = 0
         self.oscar_read_calls = 0
+        self._oscar_demotion_gathered: torch.Tensor | None = None
+        self._oscar_demotion_rotated: torch.Tensor | None = None
         # Cached device SM count; passed into the kernel dispatch each forward
         # so the hot path doesn't re-query `q.device.index` → dict lookup.
         self._sm_count: int | None = None
         if self.topk_indices_buffer is not None:
             self._sm_count = num_compute_units(self.topk_indices_buffer.device.index)
         self._warmup_autotune()
+
+    def _get_oscar_demotion_scratch(
+        self,
+        recent: torch.Tensor,
+        num_rows: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        latent_rank = recent.shape[2]
+        gathered = getattr(self, "_oscar_demotion_gathered", None)
+        if (
+            gathered is None
+            or gathered.device != recent.device
+            or gathered.dtype != recent.dtype
+            or gathered.shape[0] < num_rows
+            or gathered.shape[1] != latent_rank
+        ):
+            gathered = torch.empty(
+                (num_rows, latent_rank),
+                dtype=recent.dtype,
+                device=recent.device,
+            )
+            self._oscar_demotion_gathered = gathered
+
+        rotated = getattr(self, "_oscar_demotion_rotated", None)
+        if (
+            rotated is None
+            or rotated.device != recent.device
+            or rotated.dtype != torch.float32
+            or rotated.shape[0] < num_rows
+            or rotated.shape[1] != latent_rank
+        ):
+            rotated = torch.empty(
+                (num_rows, latent_rank),
+                dtype=torch.float32,
+                device=recent.device,
+            )
+            self._oscar_demotion_rotated = rotated
+        return gathered[:num_rows], rotated[:num_rows]
 
     @staticmethod
     def _oscar_query_positions(
@@ -158,8 +197,8 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             attn_metadata.max_query_len == 1 and num_tokens == attn_metadata.num_reqs
         )
         if is_decode:
-            query_positions = attn_metadata.seq_lens[:num_tokens] - 1
-            final_seq_lens = attn_metadata.seq_lens[:num_tokens]
+            query_positions = oscar.decode_positions[:num_tokens]
+            final_seq_lens = oscar.final_seq_lens[:num_tokens]
             token_hp_rows = oscar.hp_rows[:num_tokens]
         else:
             request_indices = attn_metadata.req_id_per_token[:num_tokens].long()
@@ -182,7 +221,10 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                     "OSCAR MLA recent-to-INT2 demotion active; first batch=%d tokens",
                     oscar.demotion_positions.numel(),
                 )
-            demotion_hp_rows = oscar.hp_rows[oscar.demotion_request_indices.long()]
+            gathered, rotated = self._get_oscar_demotion_scratch(
+                kv_cache.recent,
+                oscar.demotion_positions.numel(),
+            )
             oscar_mla_demote_recent(
                 kv_cache.recent,
                 rotation,
@@ -190,11 +232,13 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 kv_cache.history_scale,
                 kv_cache.history_zero,
                 oscar.demotion_positions,
-                demotion_hp_rows,
+                oscar.demotion_hp_rows,
                 oscar.demotion_page_ids,
                 oscar.demotion_page_offsets,
                 prefix_tokens=kv_cache.prefix.shape[1],
                 clip_ratio=clip_ratio,
+                gathered=gathered,
+                rotated=rotated,
             )
             self.oscar_demotion_calls += 1
 
