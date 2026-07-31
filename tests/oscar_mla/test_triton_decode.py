@@ -31,7 +31,7 @@ requires_cuda = pytest.mark.skipif(
 
 @pytest.mark.parametrize(
     ("num_heads", "expected"),
-    [(1, 16), (8, 16), (16, 16), (17, 32), (32, 32)],
+    [(1, 8), (8, 8), (16, 16), (17, 32), (32, 32)],
 )
 def test_prefill_head_block_size(num_heads: int, expected: int) -> None:
     assert _prefill_head_block_size(num_heads) == expected

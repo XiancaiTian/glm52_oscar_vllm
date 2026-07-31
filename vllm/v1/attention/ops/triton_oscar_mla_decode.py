@@ -878,6 +878,8 @@ def _validate_attention_inputs(
 def _prefill_head_block_size(num_heads: int) -> int:
     if num_heads <= 0:
         raise ValueError("num_heads must be positive")
+    if num_heads <= 8:
+        return 8
     return 16 if num_heads <= 16 else 32
 
 
