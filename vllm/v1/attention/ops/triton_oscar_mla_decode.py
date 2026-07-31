@@ -415,7 +415,7 @@ def _mixed_sparse_prefill_stage1(
         + dims[None, :] * stride_query_d,
         mask=head_mask[:, None] & dim_mask[None, :],
         other=0.0,
-    ).to(tl.float32)
+    ).to(tl.bfloat16)
     query_rotated = tl.load(
         query_rotated_ptr
         + query_row * stride_query_rotated_b
@@ -433,7 +433,7 @@ def _mixed_sparse_prefill_stage1(
         + rope_dims[None, :] * stride_query_rope_d,
         mask=head_mask[:, None] & rope_dim_mask[None, :],
         other=0.0,
-    ).to(tl.float32)
+    ).to(tl.bfloat16)
     hp_row = tl.load(hp_rows_ptr + safe_request * stride_hp_rows)
     seq_len = tl.load(seq_lens_ptr + safe_request * stride_seq_lens)
     causal_seq_len = tl.minimum(seq_len, query_position + 1)
@@ -484,7 +484,7 @@ def _mixed_sparse_prefill_stage1(
             is_prefix[None, :],
             prefix_values,
             recent_values,
-        ).to(tl.float32)
+        ).to(tl.bfloat16)
 
         history_indices = tokens - prefix_tokens
         logical_pages = history_indices // history_block_size
@@ -542,15 +542,15 @@ def _mixed_sparse_prefill_stage1(
             + rope_dims[:, None] * stride_rope_d,
             mask=rope_dim_mask[:, None] & valid[None, :],
             other=0.0,
-        ).to(tl.float32)
+        ).to(tl.bfloat16)
 
-        bf16_scores = tl.dot(query, bf16_values, input_precision="tf32")
+        bf16_scores = tl.dot(query, bf16_values)
         history_scores = tl.dot(
             query_rotated,
             history_values,
             input_precision="tf32",
         )
-        rope_scores = tl.dot(query_rope, rope_values, input_precision="tf32")
+        rope_scores = tl.dot(query_rope, rope_values)
         scores = (
             tl.where(
                 is_history[None, :],
@@ -568,9 +568,8 @@ def _mixed_sparse_prefill_stage1(
             probabilities = tl.exp(scores - m_new[:, None])
             probabilities = tl.where(score_mask, probabilities, 0.0)
             bf16_acc = bf16_acc * previous_scale[:, None] + tl.dot(
-                probabilities,
+                probabilities.to(tl.bfloat16),
                 tl.trans(bf16_values),
-                input_precision="tf32",
             )
             history_acc = history_acc * previous_scale[:, None] + tl.dot(
                 probabilities,
