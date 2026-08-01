@@ -51,6 +51,19 @@ def test_grouped_prefill_skips_zero_bf16_tile_dots() -> None:
     assert source.count("if has_bf16:") == 2
 
 
+def test_grouped_prefill_compacts_full_width_history_loads() -> None:
+    source = inspect.getsource(_mixed_sparse_prefill_stage1.fn)
+    assert "if latent_rank == block_d:" in source
+    assert "packed_offsets = tl.arange(0, block_d // 4)" in source
+    assert "packed_unique[:, None, :]" in source
+    assert "packed_shifts[None, :, None]" in source
+    assert "group_offsets = tl.arange(0, block_d // group_size)" in source
+    assert "scale_unique[:, None, :]" in source
+    assert "zero_unique[:, None, :]" in source
+    assert "byte_offsets = dims // 4" in source
+    assert "groups = dims // group_size" in source
+
+
 def test_triton_interpreter_smoke() -> None:
     env = os.environ.copy()
     env.update(
