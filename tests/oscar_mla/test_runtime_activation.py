@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +13,10 @@ from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.attention.backends.mla.triton_mla_sparse import (
     TritonMLASparseBackend,
+)
+from vllm.v1.attention.ops.triton_oscar_mla_decode import (
+    oscar_mla_sparse_decode,
+    oscar_mla_sparse_prefill,
 )
 from vllm.v1.kv_cache_interface import OscarMLAAttentionSpec
 
@@ -52,6 +59,19 @@ def test_mla_layer_builds_oscar_three_pool_spec() -> None:
     assert spec.history_slot_size == 160
     assert spec.prefix_tokens == 64
     assert spec.recent_tokens == 256
+
+
+@pytest.mark.parametrize(
+    "attention",
+    [oscar_mla_sparse_decode, oscar_mla_sparse_prefill],
+)
+def test_oscar_sparse_attention_accepts_keyword_only_inverse_rotation(
+    attention,
+) -> None:
+    parameter = inspect.signature(attention).parameters["inverse_rotation"]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is None
 
 
 @pytest.mark.parametrize(

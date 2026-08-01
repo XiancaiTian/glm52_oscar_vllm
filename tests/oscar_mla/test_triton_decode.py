@@ -712,6 +712,7 @@ def test_sparse_prefill_is_causal_and_matches_three_pool_oracle(
         zero_index,
         torch.tensor([seq_len], dtype=torch.int32, device=device),
         rotation,
+        inverse_rotation=rotation.T.contiguous(),
         num_splits=1,
     )
 

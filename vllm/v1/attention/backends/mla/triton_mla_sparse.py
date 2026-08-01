@@ -677,6 +677,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 oscar.hp_rows,
                 attn_metadata.seq_lens,
                 layer._oscar_rotation,
+                inverse_rotation=layer._oscar_inverse_rotation,
                 attention_scale=self.softmax_scale,
                 num_splits=16 if is_decode else 1,
             )

@@ -431,9 +431,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 prefix_tokens=64,
                 recent_tokens=256,
             )
+            self._oscar_rotation: torch.Tensor
             self.register_buffer(
                 "_oscar_rotation",
                 runtime_parameters.rotation,
+                persistent=False,
+            )
+            self._oscar_inverse_rotation: torch.Tensor
+            self.register_buffer(
+                "_oscar_inverse_rotation",
+                runtime_parameters.rotation.T.contiguous(),
                 persistent=False,
             )
             self._oscar_clip_ratio = runtime_parameters.clip_ratio
@@ -881,6 +888,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         ).T
         if self.kv_cache_dtype == "oscar_mla_int2":
             self._oscar_rotation = self._oscar_rotation.to(
+                device=kv_b_proj_weight.device,
+            )
+            self._oscar_inverse_rotation = self._oscar_inverse_rotation.to(
                 device=kv_b_proj_weight.device,
             )
 

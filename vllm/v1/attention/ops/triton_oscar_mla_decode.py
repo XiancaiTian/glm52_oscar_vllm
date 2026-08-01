@@ -909,6 +909,7 @@ def _oscar_mla_sparse_attention(
     seq_lens: torch.Tensor,
     rotation: torch.Tensor,
     *,
+    inverse_rotation: torch.Tensor | None = None,
     attention_scale: float | None = None,
     num_splits: int = 16,
     mid_bf16: torch.Tensor | None = None,
@@ -937,6 +938,12 @@ def _oscar_mla_sparse_attention(
         seq_lens,
         rotation,
     )
+    if inverse_rotation is None:
+        inverse_rotation = rotation.T
+    if inverse_rotation.shape != (latent_rank, latent_rank):
+        raise ValueError("inverse rotation shape must match query latent rank")
+    if inverse_rotation.device != query.device:
+        raise ValueError("inverse rotation must share the query CUDA device")
     if num_splits <= 0 or num_splits > 32:
         raise ValueError("num_splits must be in [1, 32]")
     topk = selected_tokens.shape[1]
@@ -1135,7 +1142,7 @@ def _oscar_mla_sparse_attention(
     flat_history = history_merged.view(num_queries * num_heads, latent_rank)
     history_original = oscar_mla_rotate(
         flat_history,
-        rotation.T,
+        inverse_rotation,
     )
     if output is None:
         output = torch.empty(
@@ -1186,6 +1193,7 @@ def oscar_mla_sparse_decode(
     seq_lens: torch.Tensor,
     rotation: torch.Tensor,
     *,
+    inverse_rotation: torch.Tensor | None = None,
     attention_scale: float | None = None,
     num_splits: int = 16,
     mid_bf16: torch.Tensor | None = None,
@@ -1220,6 +1228,7 @@ def oscar_mla_sparse_decode(
         hp_rows,
         seq_lens,
         rotation,
+        inverse_rotation=inverse_rotation,
         attention_scale=attention_scale,
         num_splits=num_splits,
         mid_bf16=mid_bf16,
@@ -1248,6 +1257,7 @@ def oscar_mla_sparse_prefill(
     seq_lens: torch.Tensor,
     rotation: torch.Tensor,
     *,
+    inverse_rotation: torch.Tensor | None = None,
     attention_scale: float | None = None,
     num_splits: int = 16,
     mid_bf16: torch.Tensor | None = None,
@@ -1274,6 +1284,7 @@ def oscar_mla_sparse_prefill(
         hp_rows,
         seq_lens,
         rotation,
+        inverse_rotation=inverse_rotation,
         attention_scale=attention_scale,
         num_splits=num_splits,
         mid_bf16=mid_bf16,

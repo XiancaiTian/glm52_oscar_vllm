@@ -428,6 +428,7 @@ def test_runtime_read_uses_local_dsa_ids_and_three_pool_cache(monkeypatch) -> No
         captured["selected"] = args[2]
         captured["query_positions"] = args[4]
         captured["block_table"] = args[8]
+        captured["inverse_rotation"] = kwargs["inverse_rotation"]
         captured["num_splits"] = kwargs["num_splits"]
         return torch.ones(1, 2, 512), torch.zeros(1, 2)
 
@@ -442,6 +443,8 @@ def test_runtime_read_uses_local_dsa_ids_and_three_pool_cache(monkeypatch) -> No
     impl.kv_cache_dtype = "oscar_mla_int2"
     impl.softmax_scale = 576**-0.5
     impl.topk_indices_buffer = torch.tensor([[0, 64, 320]], dtype=torch.int32)
+    rotation = torch.eye(512)
+    inverse_rotation = rotation.T.contiguous()
 
     output, lse = impl.forward_mqa(
         (
@@ -450,7 +453,10 @@ def test_runtime_read_uses_local_dsa_ids_and_three_pool_cache(monkeypatch) -> No
         ),
         _cache(),
         metadata,
-        SimpleNamespace(_oscar_rotation=torch.eye(512)),
+        SimpleNamespace(
+            _oscar_rotation=rotation,
+            _oscar_inverse_rotation=inverse_rotation,
+        ),
     )
 
     assert output.dtype == torch.bfloat16
@@ -458,6 +464,7 @@ def test_runtime_read_uses_local_dsa_ids_and_three_pool_cache(monkeypatch) -> No
     assert captured["selected"].tolist() == [[0, 64, 320]]
     assert captured["query_positions"].tolist() == [320]
     assert captured["block_table"] is metadata.block_table
+    assert captured["inverse_rotation"] is inverse_rotation
     assert captured["num_splits"] == 16
     assert impl.oscar_read_calls == 1
 
@@ -517,7 +524,10 @@ def test_runtime_read_maps_multiple_requests_to_local_positions(monkeypatch) -> 
         ),
         _cache(),
         metadata,
-        SimpleNamespace(_oscar_rotation=torch.eye(512)),
+        SimpleNamespace(
+            _oscar_rotation=torch.eye(512),
+            _oscar_inverse_rotation=torch.eye(512),
+        ),
     )
 
     assert output.shape == (3, 2, 512)
@@ -562,7 +572,10 @@ def test_runtime_prefill_crops_invalid_topk_tail(monkeypatch) -> None:
         ),
         _cache(),
         metadata,
-        SimpleNamespace(_oscar_rotation=torch.eye(512)),
+        SimpleNamespace(
+            _oscar_rotation=torch.eye(512),
+            _oscar_inverse_rotation=torch.eye(512),
+        ),
     )
 
     selected = captured["selected"]
