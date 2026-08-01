@@ -499,85 +499,34 @@ def _mixed_sparse_prefill_stage1(
             mask=is_history,
             other=0,
         )
+        byte_offsets = dims // 4
+        shifts = (dims % 4) * 2
         data_base = physical_pages * stride_data_page + page_offsets * stride_data_token
-        if latent_rank == block_d:
-            packed_offsets = tl.arange(0, block_d // 4)
-            packed_unique = tl.load(
-                history_data_ptr
-                + data_base[None, :]
-                + packed_offsets[:, None] * stride_data_byte,
-                mask=is_history[None, :],
-                other=0,
-            ).to(tl.int32)
-            packed = tl.broadcast_to(
-                packed_unique[:, None, :],
-                block_d // 4,
-                4,
-                block_t,
-            )
-            packed_shifts = tl.arange(0, 4) * 2
-            quantized = ((packed >> packed_shifts[None, :, None]) & 0x3).to(tl.float32)
-            quantized = tl.reshape(quantized, block_d, block_t)
-
-            group_offsets = tl.arange(0, block_d // group_size)
-            scale_unique = tl.load(
-                history_scale_ptr
-                + physical_pages[None, :] * stride_scale_page
-                + page_offsets[None, :] * stride_scale_token
-                + group_offsets[:, None] * stride_scale_group,
-                mask=is_history[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            zero_unique = tl.load(
-                history_zero_ptr
-                + physical_pages[None, :] * stride_zero_page
-                + page_offsets[None, :] * stride_zero_token
-                + group_offsets[:, None] * stride_zero_group,
-                mask=is_history[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            scale = tl.broadcast_to(
-                scale_unique[:, None, :],
-                block_d // group_size,
-                group_size,
-                block_t,
-            )
-            zero = tl.broadcast_to(
-                zero_unique[:, None, :],
-                block_d // group_size,
-                group_size,
-                block_t,
-            )
-            scale = tl.reshape(scale, block_d, block_t)
-            zero = tl.reshape(zero, block_d, block_t)
-        else:
-            byte_offsets = dims // 4
-            shifts = (dims % 4) * 2
-            packed = tl.load(
-                history_data_ptr
-                + data_base[None, :]
-                + byte_offsets[:, None] * stride_data_byte,
-                mask=dim_mask[:, None] & is_history[None, :],
-                other=0,
-            ).to(tl.int32)
-            quantized = ((packed >> shifts[:, None]) & 0x3).to(tl.float32)
-            groups = dims // group_size
-            scale = tl.load(
-                history_scale_ptr
-                + physical_pages[None, :] * stride_scale_page
-                + page_offsets[None, :] * stride_scale_token
-                + groups[:, None] * stride_scale_group,
-                mask=dim_mask[:, None] & is_history[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            zero = tl.load(
-                history_zero_ptr
-                + physical_pages[None, :] * stride_zero_page
-                + page_offsets[None, :] * stride_zero_token
-                + groups[:, None] * stride_zero_group,
-                mask=dim_mask[:, None] & is_history[None, :],
-                other=0.0,
-            ).to(tl.float32)
+        packed = tl.load(
+            history_data_ptr
+            + data_base[None, :]
+            + byte_offsets[:, None] * stride_data_byte,
+            mask=dim_mask[:, None] & is_history[None, :],
+            other=0,
+        ).to(tl.int32)
+        quantized = ((packed >> shifts[:, None]) & 0x3).to(tl.float32)
+        groups = dims // group_size
+        scale = tl.load(
+            history_scale_ptr
+            + physical_pages[None, :] * stride_scale_page
+            + page_offsets[None, :] * stride_scale_token
+            + groups[:, None] * stride_scale_group,
+            mask=dim_mask[:, None] & is_history[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        zero = tl.load(
+            history_zero_ptr
+            + physical_pages[None, :] * stride_zero_page
+            + page_offsets[None, :] * stride_zero_token
+            + groups[:, None] * stride_zero_group,
+            mask=dim_mask[:, None] & is_history[None, :],
+            other=0.0,
+        ).to(tl.float32)
         history_values = (quantized - zero) * scale
 
         rope_logical_pages = tokens // rope_block_size
