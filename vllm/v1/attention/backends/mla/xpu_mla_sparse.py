@@ -26,6 +26,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     triton_convert_req_index_to_global_index,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -95,6 +96,10 @@ class XPUMLASparseMetadata(AttentionMetadata):
     block_table: torch.Tensor
     req_id_per_token: torch.Tensor
     seq_lens: torch.Tensor
+    num_decodes: int = 0
+    num_prefills: int = 0
+    num_decode_tokens: int = 0
+    num_prefill_tokens: int = 0
     oscar_mla: "OscarMLABatchMetadata | None" = None
 
     block_size: int = 1
@@ -123,6 +128,11 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens = vllm_config.model_config.hf_config.index_topk
+        self.num_speculative_tokens = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
         self.topk_tokens_tensor = torch.tensor(
             [self.topk_tokens], device=device, dtype=torch.int32
         )
@@ -159,6 +169,14 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
         )
 
         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+        next_n = self.num_speculative_tokens + 1
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=next_n,
+                require_uniform=next_n in (1, 2),
+            )
+        )
         full_topk_start = 0
         base_seq_len = 0
         if common_attn_metadata.num_reqs == 1 and common_attn_metadata.causal:
@@ -182,6 +200,10 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
             block_table=common_attn_metadata.block_table_tensor,
             req_id_per_token=req_id_per_token,
             seq_lens=common_attn_metadata.seq_lens,
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            num_decode_tokens=num_decode_tokens,
+            num_prefill_tokens=num_prefill_tokens,
             oscar_mla=common_attn_metadata.oscar_mla,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,

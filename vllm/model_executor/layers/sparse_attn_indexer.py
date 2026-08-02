@@ -119,6 +119,10 @@ _PREFILL_MQA_CANONICAL_M = _env_int(
     "VLLM_MQA_CUDA_V7_FUSED_TRITON_PREFILL_CANONICAL_M",
     "0",
 )
+_PREFILL_TOPK_TOKENS = _env_int(
+    "VLLM_SPARSE_INDEXER_PREFILL_TOPK_TOKENS",
+    "0",
+)
 
 
 def _shape_bucket_trace_sync(device: torch.device) -> None:
@@ -283,6 +287,14 @@ def sparse_attn_indexer(
     if not (skip_prefill_topk_clear or skip_decode_topk_clear):
         topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
+        prefill_topk_tokens = topk_tokens
+        if _PREFILL_TOPK_TOKENS > 0:
+            if topk_tokens < _PREFILL_TOPK_TOKENS:
+                raise ValueError(
+                    "VLLM_SPARSE_INDEXER_PREFILL_TOPK_TOKENS must not exceed "
+                    f"the model index_topk ({topk_tokens})"
+                )
+            prefill_topk_tokens = _PREFILL_TOPK_TOKENS
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
         if _PREFILL_SHAPE_BUCKET_TRACE:
@@ -514,7 +526,7 @@ def sparse_attn_indexer(
                 w_chunk = weights[chunk.token_start : chunk.token_end]
                 k_scales = k_scale.view(torch.float32).flatten()
                 topk_indices = topk_indices_buffer[
-                    chunk.token_start : chunk.token_end, :topk_tokens
+                    chunk.token_start : chunk.token_end, :prefill_topk_tokens
                 ]
                 cu_seqlen_ks = chunk.cu_seqlen_ks
                 cu_seqlen_ke = chunk.cu_seqlen_ke
@@ -743,7 +755,7 @@ def sparse_attn_indexer(
                     num_rows,
                     logits.stride(0),
                     logits.stride(1),
-                    topk_tokens,
+                    prefill_topk_tokens,
                 )
             elif (
                 current_platform.is_cuda()
@@ -759,7 +771,7 @@ def sparse_attn_indexer(
                     cu_seqlen_ke,
                     topk_indices,
                     topk_workspace,
-                    topk_tokens,
+                    prefill_topk_tokens,
                     attn_metadata_narrowed.max_seq_len,
                 )
             elif current_platform.is_xpu():
@@ -771,7 +783,7 @@ def sparse_attn_indexer(
                     num_rows,
                     logits.stride(0),
                     logits.stride(1),
-                    topk_tokens,
+                    prefill_topk_tokens,
                 )
             else:
                 torch.ops._C.top_k_per_row_prefill(
@@ -782,7 +794,7 @@ def sparse_attn_indexer(
                     num_rows,
                     logits.stride(0),
                     logits.stride(1),
-                    topk_tokens,
+                    prefill_topk_tokens,
                 )
             if _PREFILL_SHAPE_BUCKET_TRACE:
                 logger.info(
@@ -794,7 +806,7 @@ def sparse_attn_indexer(
                     chunk.token_end - chunk.token_start,
                     chunk.active_seq_lens,
                     num_rows,
-                    topk_tokens,
+                    prefill_topk_tokens,
                     _shape_bucket_trace_ms(trace_topk_start, hidden_states.device),
                 )
     if has_decode:

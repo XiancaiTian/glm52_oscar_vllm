@@ -88,6 +88,10 @@ _FORCE_PREFIX_MASK_DECODE_MAX_TOKENS = _env_int(
     4,
 )
 _PREFILL_SHAPE_BUCKET_TRACE = _env_flag("VLLM_PREFILL_SHAPE_BUCKET_TRACE")
+_PREFILL_TOPK_TOKENS = _env_int(
+    "VLLM_SPARSE_INDEXER_PREFILL_TOPK_TOKENS",
+    0,
+)
 logger = init_logger(__name__)
 
 
@@ -648,39 +652,94 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 raise RuntimeError("oscar_mla_int2 attention metadata is missing")
             q_nope, q_pe = q
             num_actual_toks = q_nope.shape[0]
-            assert self.topk_indices_buffer is not None
-            is_decode = (
-                attn_metadata.max_query_len == 1
-                and num_actual_toks == attn_metadata.num_reqs
-            )
-            topk_width = attn_metadata.topk_tokens
-            if not is_decode:
-                topk_width = min(topk_width, attn_metadata.max_seq_len)
+            topk_indices_buffer = self.topk_indices_buffer
+            assert topk_indices_buffer is not None
             query_positions = self._oscar_query_positions(
                 attn_metadata,
                 num_actual_toks,
             )
-            output, lse = oscar_mla_sparse_prefill(
-                q_nope,
-                q_pe,
-                self.topk_indices_buffer[:num_actual_toks, :topk_width],
-                attn_metadata.req_id_per_token[:num_actual_toks],
-                query_positions,
-                kv_c_and_k_pe_cache.prefix,
-                kv_c_and_k_pe_cache.recent,
-                kv_c_and_k_pe_cache.rope,
-                attn_metadata.block_table,
-                kv_c_and_k_pe_cache.history_data,
-                kv_c_and_k_pe_cache.history_scale,
-                kv_c_and_k_pe_cache.history_zero,
-                oscar.history_page_table,
-                oscar.hp_rows,
-                attn_metadata.seq_lens,
-                layer._oscar_rotation,
-                inverse_rotation=layer._oscar_inverse_rotation,
-                attention_scale=self.softmax_scale,
-                num_splits=16 if is_decode else 1,
-            )
+
+            def read_tokens(
+                token_start: int,
+                token_end: int,
+                topk_width: int,
+                num_splits: int,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                token_slice = slice(token_start, token_end)
+                return oscar_mla_sparse_prefill(
+                    q_nope[token_slice],
+                    q_pe[token_slice],
+                    topk_indices_buffer[token_slice, :topk_width],
+                    attn_metadata.req_id_per_token[token_slice],
+                    query_positions[token_slice],
+                    kv_c_and_k_pe_cache.prefix,
+                    kv_c_and_k_pe_cache.recent,
+                    kv_c_and_k_pe_cache.rope,
+                    attn_metadata.block_table,
+                    kv_c_and_k_pe_cache.history_data,
+                    kv_c_and_k_pe_cache.history_scale,
+                    kv_c_and_k_pe_cache.history_zero,
+                    oscar.history_page_table,
+                    oscar.hp_rows,
+                    attn_metadata.seq_lens,
+                    layer._oscar_rotation,
+                    inverse_rotation=layer._oscar_inverse_rotation,
+                    attention_scale=self.softmax_scale,
+                    num_splits=num_splits,
+                )
+
+            if _PREFILL_TOPK_TOKENS <= 0:
+                is_decode = (
+                    attn_metadata.max_query_len == 1
+                    and num_actual_toks == attn_metadata.num_reqs
+                )
+                topk_width = attn_metadata.topk_tokens
+                if not is_decode:
+                    topk_width = min(topk_width, attn_metadata.max_seq_len)
+                output, lse = read_tokens(
+                    0,
+                    num_actual_toks,
+                    topk_width,
+                    16 if is_decode else 1,
+                )
+            else:
+                if attn_metadata.topk_tokens < _PREFILL_TOPK_TOKENS:
+                    raise ValueError(
+                        "VLLM_SPARSE_INDEXER_PREFILL_TOPK_TOKENS must not "
+                        "exceed the model index_topk "
+                        f"({attn_metadata.topk_tokens})"
+                    )
+                if (
+                    attn_metadata.num_decode_tokens + attn_metadata.num_prefill_tokens
+                    != num_actual_toks
+                ):
+                    raise RuntimeError(
+                        "OSCAR MLA split-K metadata does not cover all tokens"
+                    )
+                decode_result = None
+                if attn_metadata.num_decode_tokens > 0:
+                    decode_result = read_tokens(
+                        0,
+                        attn_metadata.num_decode_tokens,
+                        attn_metadata.topk_tokens,
+                        16,
+                    )
+                prefill_result = None
+                if attn_metadata.num_prefill_tokens > 0:
+                    prefill_result = read_tokens(
+                        attn_metadata.num_decode_tokens,
+                        num_actual_toks,
+                        min(_PREFILL_TOPK_TOKENS, attn_metadata.max_seq_len),
+                        1,
+                    )
+                if decode_result is None:
+                    assert prefill_result is not None
+                    output, lse = prefill_result
+                elif prefill_result is None:
+                    output, lse = decode_result
+                else:
+                    output = torch.cat((decode_result[0], prefill_result[0]))
+                    lse = torch.cat((decode_result[1], prefill_result[1]))
             if self.oscar_read_calls == 0:
                 logger.info_once(
                     "OSCAR MLA DSA-selected mixed prefix/recent/INT2 read active"

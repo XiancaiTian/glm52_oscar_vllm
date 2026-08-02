@@ -13,6 +13,7 @@ from vllm.v1.attention.backends.mla.triton_mla_sparse import (
 )
 from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
     XPUMLASparseMetadata,
+    XPUMLASparseMetadataBuilder,
 )
 from vllm.v1.worker.gpu_worker import (
     _collect_oscar_mla_call_counts,
@@ -82,6 +83,10 @@ def _metadata(
         block_table=torch.arange(32, dtype=torch.int32).unsqueeze(0),
         req_id_per_token=torch.zeros(num_tokens, dtype=torch.int32),
         seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+        num_decodes=1 if num_tokens == 1 else 0,
+        num_prefills=0 if num_tokens == 1 else 1,
+        num_decode_tokens=1 if num_tokens == 1 else 0,
+        num_prefill_tokens=0 if num_tokens == 1 else num_tokens,
         oscar_mla=oscar,
         block_size=16,
         base_seq_len=query_start,
@@ -94,6 +99,35 @@ def _impl() -> TritonMLASparseImpl:
     impl.oscar_demotion_calls = 0
     impl.oscar_read_calls = 0
     return impl
+
+
+def test_metadata_builder_tracks_mixed_decode_prefill_split() -> None:
+    builder = object.__new__(XPUMLASparseMetadataBuilder)
+    builder.req_id_per_token_buffer = torch.empty(3, dtype=torch.int32)
+    builder.num_speculative_tokens = 0
+    builder.topk_tokens = 1024
+    builder.kv_cache_spec = SimpleNamespace(block_size=16)
+    common = SimpleNamespace(
+        num_actual_tokens=3,
+        query_start_loc_cpu=torch.tensor([0, 1, 3], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1, 3], dtype=torch.int32),
+        num_reqs=2,
+        max_query_len=2,
+        max_seq_len=337,
+        causal=False,
+        slot_mapping=torch.arange(3, dtype=torch.int32),
+        block_table_tensor=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+        seq_lens=torch.tensor([321, 337], dtype=torch.int32),
+        oscar_mla=None,
+    )
+
+    metadata = builder.build(0, common)
+
+    assert metadata.req_id_per_token.tolist() == [0, 1, 1]
+    assert metadata.num_decodes == 1
+    assert metadata.num_prefills == 1
+    assert metadata.num_decode_tokens == 1
+    assert metadata.num_prefill_tokens == 2
 
 
 def test_runtime_call_counts_aggregate_all_oscar_layers() -> None:
@@ -433,6 +467,7 @@ def test_runtime_read_uses_local_dsa_ids_and_three_pool_cache(monkeypatch) -> No
         return torch.ones(1, 2, 512), torch.zeros(1, 2)
 
     monkeypatch.setattr(triton_mla_sparse, "oscar_mla_sparse_prefill", _read)
+    monkeypatch.setattr(triton_mla_sparse, "_PREFILL_TOPK_TOKENS", 2, raising=False)
     metadata = _metadata(
         query_start=320,
         seq_len=321,
@@ -470,19 +505,25 @@ def test_runtime_read_uses_local_dsa_ids_and_three_pool_cache(monkeypatch) -> No
 
 
 def test_runtime_read_maps_multiple_requests_to_local_positions(monkeypatch) -> None:
-    captured: dict[str, Any] = {}
+    captured: list[dict[str, Any]] = []
 
     def _read(*args, **kwargs):
-        captured["selected"] = args[2]
-        captured["request_indices"] = args[3]
-        captured["query_positions"] = args[4]
-        captured["block_table"] = args[8]
-        captured["history_page_table"] = args[12]
-        captured["hp_rows"] = args[13]
-        captured["num_splits"] = kwargs["num_splits"]
-        return torch.ones(3, 2, 512), torch.zeros(3, 2)
+        captured.append(
+            {
+                "selected": args[2],
+                "request_indices": args[3],
+                "query_positions": args[4],
+                "block_table": args[8],
+                "history_page_table": args[12],
+                "hp_rows": args[13],
+                "num_splits": kwargs["num_splits"],
+            }
+        )
+        num_tokens = args[0].shape[0]
+        return torch.ones(num_tokens, 2, 512), torch.zeros(num_tokens, 2)
 
     monkeypatch.setattr(triton_mla_sparse, "oscar_mla_sparse_prefill", _read)
+    monkeypatch.setattr(triton_mla_sparse, "_PREFILL_TOPK_TOKENS", 2, raising=False)
     empty = torch.empty(0, dtype=torch.int32)
     oscar = OscarMLABatchMetadata(
         hp_rows=torch.tensor([2, 1], dtype=torch.int32),
@@ -509,11 +550,16 @@ def test_runtime_read_maps_multiple_requests_to_local_positions(monkeypatch) -> 
         block_size=16,
         base_seq_len=320,
     )
+    metadata.num_decodes = 1
+    metadata.num_prefills = 1
+    metadata.num_decode_tokens = 1
+    metadata.num_prefill_tokens = 2
+    metadata.topk_tokens = 4
     impl = _impl()
     impl.kv_cache_dtype = "oscar_mla_int2"
     impl.softmax_scale = 576**-0.5
     impl.topk_indices_buffer = torch.tensor(
-        [[0, 64, 320], [0, 64, 334], [0, 64, 336]],
+        [[0, 64, 319, 320], [0, 64, 333, 334], [0, 64, 335, 336]],
         dtype=torch.int32,
     )
 
@@ -532,13 +578,20 @@ def test_runtime_read_maps_multiple_requests_to_local_positions(monkeypatch) -> 
 
     assert output.shape == (3, 2, 512)
     assert lse is None
-    assert captured["selected"].tolist() == impl.topk_indices_buffer.tolist()
-    assert captured["request_indices"].tolist() == [0, 1, 1]
-    assert captured["query_positions"].tolist() == [320, 335, 336]
-    assert captured["block_table"] is metadata.block_table
-    assert captured["history_page_table"] is oscar.history_page_table
-    assert captured["hp_rows"] is oscar.hp_rows
-    assert captured["num_splits"] == 1
+    assert len(captured) == 2
+    decode, prefill = captured
+    assert decode["selected"].tolist() == [[0, 64, 319, 320]]
+    assert decode["request_indices"].tolist() == [0]
+    assert decode["query_positions"].tolist() == [320]
+    assert decode["num_splits"] == 16
+    assert prefill["selected"].tolist() == [[0, 64], [0, 64]]
+    assert prefill["request_indices"].tolist() == [1, 1]
+    assert prefill["query_positions"].tolist() == [335, 336]
+    assert prefill["num_splits"] == 1
+    for call in captured:
+        assert call["block_table"] is metadata.block_table
+        assert call["history_page_table"] is oscar.history_page_table
+        assert call["hp_rows"] is oscar.hp_rows
 
 
 def test_runtime_prefill_crops_invalid_topk_tail(monkeypatch) -> None:
@@ -550,6 +603,7 @@ def test_runtime_prefill_crops_invalid_topk_tail(monkeypatch) -> None:
         return torch.ones(3, 2, 512), torch.zeros(3, 2)
 
     monkeypatch.setattr(triton_mla_sparse, "oscar_mla_sparse_prefill", _read)
+    monkeypatch.setattr(triton_mla_sparse, "_PREFILL_TOPK_TOKENS", 2, raising=False)
     metadata = _metadata(
         query_start=0,
         seq_len=3,
@@ -580,6 +634,6 @@ def test_runtime_prefill_crops_invalid_topk_tail(monkeypatch) -> None:
 
     selected = captured["selected"]
     assert isinstance(selected, torch.Tensor)
-    assert selected.shape == (3, 3)
-    assert selected.tolist() == impl.topk_indices_buffer[:, :3].tolist()
+    assert selected.shape == (3, 2)
+    assert selected.tolist() == impl.topk_indices_buffer[:, :2].tolist()
     assert captured["num_splits"] == 1
