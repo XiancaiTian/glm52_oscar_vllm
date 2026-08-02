@@ -14,6 +14,8 @@ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.attention.backends.mla.triton_mla_sparse import (
     TritonMLASparseBackend,
 )
+from vllm.v1.attention.ops import triton_oscar_mla_decode as oscar_decode
+from vllm.v1.attention.ops import triton_oscar_mla_store as oscar_store
 from vllm.v1.attention.ops.triton_oscar_mla_decode import (
     oscar_mla_sparse_decode,
     oscar_mla_sparse_prefill,
@@ -72,6 +74,20 @@ def test_oscar_sparse_attention_accepts_keyword_only_inverse_rotation(
 
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.default is None
+
+
+def test_oscar_inverse_rotation_fusion_contract() -> None:
+    assert hasattr(oscar_store, "oscar_mla_rotate_add")
+    rotate_add = oscar_store.oscar_mla_rotate_add
+    parameters = inspect.signature(rotate_add).parameters
+
+    assert tuple(parameters) == ("latent", "rotation", "addend", "output")
+    assert parameters["output"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["output"].default is None
+
+    source = inspect.getsource(oscar_decode._oscar_mla_sparse_attention)
+    assert "oscar_mla_rotate_add(" in source
+    assert "_add_outputs_kernel" not in source
 
 
 @pytest.mark.parametrize(
