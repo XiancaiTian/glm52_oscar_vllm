@@ -14,8 +14,6 @@ from vllm.v1.attention.ops.triton_oscar_mla_store import (
     _clip_index,
     oscar_mla_demote_recent,
     oscar_mla_dequantize_history,
-    oscar_mla_rotate,
-    oscar_mla_rotate_add,
     oscar_mla_rotate_quantize_store,
     oscar_mla_store_bf16,
     oscar_mla_store_rope,
@@ -74,41 +72,6 @@ def test_clip_index_matches_reference_boundaries() -> None:
     assert _clip_index(1.0, 128) == 127
     with pytest.raises(ValueError, match="clip_ratio"):
         _clip_index(0.0, 128)
-
-
-@requires_cuda
-@pytest.mark.parametrize("num_rows", [8, 16384])
-def test_rotate_add_matches_separate_fp32_add(num_rows: int) -> None:
-    device = torch.device("cuda")
-    dim = 512
-    generator = torch.Generator(device=device).manual_seed(83 + num_rows)
-    latent = torch.randn(
-        num_rows,
-        dim,
-        generator=generator,
-        device=device,
-        dtype=torch.bfloat16,
-    )
-    rotation = _rotation(dim, device=device).T.contiguous()
-    addend = torch.randn(
-        num_rows,
-        dim,
-        generator=generator,
-        device=device,
-        dtype=torch.float32,
-    )
-    expected = oscar_mla_rotate(latent, rotation) + addend
-    output = torch.empty_like(addend)
-
-    actual = oscar_mla_rotate_add(
-        latent,
-        rotation,
-        addend,
-        output=output,
-    )
-
-    assert actual.data_ptr() == output.data_ptr()
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @requires_cuda

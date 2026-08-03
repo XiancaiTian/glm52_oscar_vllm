@@ -76,18 +76,12 @@ def test_oscar_sparse_attention_accepts_keyword_only_inverse_rotation(
     assert parameter.default is None
 
 
-def test_oscar_inverse_rotation_fusion_contract() -> None:
-    assert hasattr(oscar_store, "oscar_mla_rotate_add")
-    rotate_add = oscar_store.oscar_mla_rotate_add
-    parameters = inspect.signature(rotate_add).parameters
-
-    assert tuple(parameters) == ("latent", "rotation", "addend", "output")
-    assert parameters["output"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert parameters["output"].default is None
-
+def test_oscar_inverse_rotation_separate_add_contract() -> None:
     source = inspect.getsource(oscar_decode._oscar_mla_sparse_attention)
-    assert "oscar_mla_rotate_add(" in source
-    assert "_add_outputs_kernel" not in source
+    assert not hasattr(oscar_store, "oscar_mla_rotate_add")
+    assert "history_original = oscar_mla_rotate(" in source
+    assert "_add_outputs_kernel[(num_queries * num_heads,)]" in source
+    assert "oscar_mla_rotate_add(" not in source
 
 
 @pytest.mark.parametrize(

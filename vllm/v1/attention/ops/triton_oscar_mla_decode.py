@@ -13,7 +13,6 @@ from vllm.v1.attention.ops.triton_oscar_mla_store import (
     _require_cuda_tensor,
     _validate_history_tensors,
     oscar_mla_rotate,
-    oscar_mla_rotate_add,
 )
 
 
@@ -705,6 +704,41 @@ def _merge_mixed_splits_kernel(
     )
 
 
+@triton.jit
+def _add_outputs_kernel(
+    left_ptr,
+    right_ptr,
+    output_ptr,
+    num_rows,
+    latent_rank: tl.constexpr,
+    stride_left_row: tl.constexpr,
+    stride_left_d: tl.constexpr,
+    stride_right_row: tl.constexpr,
+    stride_right_d: tl.constexpr,
+    stride_output_row: tl.constexpr,
+    stride_output_d: tl.constexpr,
+    block_d: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if row >= num_rows:
+        return
+    dims = tl.arange(0, block_d)
+    mask = dims < latent_rank
+    left = tl.load(
+        left_ptr + row * stride_left_row + dims * stride_left_d,
+        mask=mask,
+    ).to(tl.float32)
+    right = tl.load(
+        right_ptr + row * stride_right_row + dims * stride_right_d,
+        mask=mask,
+    ).to(tl.float32)
+    tl.store(
+        output_ptr + row * stride_output_row + dims * stride_output_d,
+        left + right,
+        mask=mask,
+    )
+
+
 def _validate_attention_inputs(
     query: torch.Tensor,
     query_rope: torch.Tensor,
@@ -1105,6 +1139,11 @@ def _oscar_mla_sparse_attention(
         num_stages=1,
     )
 
+    flat_history = history_merged.view(num_queries * num_heads, latent_rank)
+    history_original = oscar_mla_rotate(
+        flat_history,
+        inverse_rotation,
+    )
     if output is None:
         output = torch.empty(
             merged_shape,
@@ -1119,11 +1158,21 @@ def _oscar_mla_sparse_attention(
         raise ValueError("output has incompatible shape, dtype, or device")
     flat_bf16 = bf16_merged.view(num_queries * num_heads, latent_rank)
     flat_output = output.view(num_queries * num_heads, latent_rank)
-    oscar_mla_rotate_add(
-        history_merged.view(num_queries * num_heads, latent_rank),
-        inverse_rotation,
+    _add_outputs_kernel[(num_queries * num_heads,)](
         flat_bf16,
-        output=flat_output,
+        history_original,
+        flat_output,
+        num_queries * num_heads,
+        latent_rank=latent_rank,
+        stride_left_row=flat_bf16.stride(0),
+        stride_left_d=flat_bf16.stride(1),
+        stride_right_row=history_original.stride(0),
+        stride_right_d=history_original.stride(1),
+        stride_output_row=flat_output.stride(0),
+        stride_output_d=flat_output.stride(1),
+        block_d=block_d,
+        num_warps=4,
+        num_stages=1,
     )
     return output, output_lse
 

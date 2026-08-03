@@ -13,7 +13,6 @@ from vllm.triton_utils import tl, triton
 def _rotate_latent_kernel(
     latent_ptr,
     rotation_ptr,
-    addend_ptr,
     output_ptr,
     num_rows,
     latent_rank: tl.constexpr,
@@ -21,11 +20,8 @@ def _rotate_latent_kernel(
     stride_latent_dim: tl.constexpr,
     stride_rotation_row: tl.constexpr,
     stride_rotation_col: tl.constexpr,
-    stride_addend_row: tl.constexpr,
-    stride_addend_dim: tl.constexpr,
     stride_output_row: tl.constexpr,
     stride_output_dim: tl.constexpr,
-    has_addend: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
@@ -69,19 +65,6 @@ def _rotate_latent_kernel(
         )
         latent_ptrs += block_k * stride_latent_dim
         rotation_ptrs += block_k * stride_rotation_row
-
-    if has_addend:
-        addend_ptrs = (
-            addend_ptr
-            + rows[:, None] * stride_addend_row
-            + cols[None, :] * stride_addend_dim
-        )
-        addend = tl.load(
-            addend_ptrs,
-            mask=(rows[:, None] < num_rows) & (cols[None, :] < latent_rank),
-            other=0.0,
-        ).to(tl.float32)
-        accumulator += addend
 
     output_ptrs = (
         output_ptr
@@ -508,82 +491,13 @@ def oscar_mla_rotate(
     if num_rows == 0:
         return output
 
-    _launch_oscar_mla_rotate(latent, rotation, output)
-    return output
-
-
-def oscar_mla_rotate_add(
-    latent: torch.Tensor,
-    rotation: torch.Tensor,
-    addend: torch.Tensor,
-    *,
-    output: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Rotate latent rows and add an FP32 tensor before the final store."""
-    _require_cuda_tensor(
-        latent,
-        name="latent",
-        ndim=2,
-        dtype=(torch.bfloat16, torch.float16, torch.float32),
-    )
-    _require_cuda_tensor(
-        rotation,
-        name="rotation",
-        ndim=2,
-        dtype=(torch.bfloat16, torch.float16, torch.float32),
-    )
-    _require_cuda_tensor(
-        addend,
-        name="addend",
-        ndim=2,
-        dtype=torch.float32,
-    )
-    num_rows, latent_rank = latent.shape
-    if rotation.shape != (latent_rank, latent_rank):
-        raise ValueError("rotation must be square and match the latent rank")
-    if addend.shape != latent.shape:
-        raise ValueError("rotation addend shape must match latent")
-    if not (latent.device == rotation.device == addend.device):
-        raise ValueError("latent, rotation, and addend must share one CUDA device")
-    if output is None:
-        output = torch.empty(
-            (num_rows, latent_rank),
-            dtype=torch.float32,
-            device=latent.device,
-        )
-    else:
-        _require_cuda_tensor(
-            output,
-            name="output",
-            ndim=2,
-            dtype=torch.float32,
-        )
-        if output.shape != latent.shape or output.device != latent.device:
-            raise ValueError("rotation output shape/device must match latent")
-    if num_rows == 0:
-        return output
-
-    _launch_oscar_mla_rotate(latent, rotation, output, addend=addend)
-    return output
-
-
-def _launch_oscar_mla_rotate(
-    latent: torch.Tensor,
-    rotation: torch.Tensor,
-    output: torch.Tensor,
-    *,
-    addend: torch.Tensor | None = None,
-) -> None:
-    num_rows, latent_rank = latent.shape
+    block_m = 16
     block_n = 64
     block_k = 32
-    block_m = 16
     grid = (triton.cdiv(num_rows, block_m) * triton.cdiv(latent_rank, block_n),)
-    addend_arg = output if addend is None else addend
     _rotate_latent_kernel[grid](
         latent,
         rotation,
-        addend_arg,
         output,
         num_rows,
         latent_rank=latent_rank,
@@ -591,17 +505,15 @@ def _launch_oscar_mla_rotate(
         stride_latent_dim=latent.stride(1),
         stride_rotation_row=rotation.stride(0),
         stride_rotation_col=rotation.stride(1),
-        stride_addend_row=addend_arg.stride(0),
-        stride_addend_dim=addend_arg.stride(1),
         stride_output_row=output.stride(0),
         stride_output_dim=output.stride(1),
-        has_addend=addend is not None,
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
         num_warps=4,
         num_stages=2,
     )
+    return output
 
 
 def oscar_mla_quantize_store_history(
