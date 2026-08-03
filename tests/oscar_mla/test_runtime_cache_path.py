@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+from vllm.model_executor.layers import sparse_attn_indexer
 from vllm.model_executor.layers.attention import mla_attention
 from vllm.v1.attention.backends.mla import triton_mla_sparse
 from vllm.v1.attention.backends.mla.triton_mla_sparse import (
@@ -99,6 +100,32 @@ def _impl() -> TritonMLASparseImpl:
     impl.oscar_demotion_calls = 0
     impl.oscar_read_calls = 0
     return impl
+
+
+def test_native_prefill_topk_uses_contiguous_output_for_narrow_view() -> None:
+    base = torch.full((4, 8), -1, dtype=torch.int32)
+    target = base[:, :2]
+
+    output, copy_target = sparse_attn_indexer._prepare_native_topk_output(target)
+
+    assert output.is_contiguous()
+    assert output.stride() == (2, 1)
+    assert copy_target is target
+
+    output.copy_(torch.tensor([[0, 1], [10, 11], [20, 21], [30, 31]]))
+    copy_target.copy_(output)
+
+    assert target.tolist() == [[0, 1], [10, 11], [20, 21], [30, 31]]
+    assert torch.equal(base[:, 2:], torch.full((4, 6), -1, dtype=torch.int32))
+
+
+def test_native_prefill_topk_reuses_contiguous_output() -> None:
+    target = torch.empty((4, 8), dtype=torch.int32)
+
+    output, copy_target = sparse_attn_indexer._prepare_native_topk_output(target)
+
+    assert output is target
+    assert copy_target is None
 
 
 def test_metadata_builder_tracks_mixed_decode_prefill_split() -> None:

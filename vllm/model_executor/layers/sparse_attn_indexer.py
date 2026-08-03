@@ -135,6 +135,17 @@ def _shape_bucket_trace_ms(start: float, device: torch.device) -> float:
     return (time.perf_counter() - start) * 1000.0
 
 
+def _prepare_native_topk_output(
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if target.is_contiguous():
+        return target, None
+    return (
+        torch.empty_like(target, memory_format=torch.contiguous_format),
+        target,
+    )
+
+
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -511,6 +522,12 @@ def sparse_attn_indexer(
             if _PREFILL_SHAPE_BUCKET_TRACE:
                 _shape_bucket_trace_sync(hidden_states.device)
                 trace_mqa_start = time.perf_counter()
+            topk_target = topk_indices_buffer[
+                chunk.token_start : chunk.token_end, :prefill_topk_tokens
+            ]
+            topk_indices, topk_copy_target = _prepare_native_topk_output(
+                topk_target
+            )
             if is_deep_gemm_supported():
                 logits = fp8_mqa_logits(
                     q_fp8[chunk.token_start : chunk.token_end],
@@ -525,9 +542,6 @@ def sparse_attn_indexer(
                 q_chunk = q_fp8[chunk.token_start : chunk.token_end]
                 w_chunk = weights[chunk.token_start : chunk.token_end]
                 k_scales = k_scale.view(torch.float32).flatten()
-                topk_indices = topk_indices_buffer[
-                    chunk.token_start : chunk.token_end, :prefill_topk_tokens
-                ]
                 cu_seqlen_ks = chunk.cu_seqlen_ks
                 cu_seqlen_ke = chunk.cu_seqlen_ke
                 token_start = chunk.token_start
@@ -796,6 +810,8 @@ def sparse_attn_indexer(
                     logits.stride(1),
                     prefill_topk_tokens,
                 )
+            if topk_copy_target is not None:
+                topk_copy_target.copy_(topk_indices)
             if _PREFILL_SHAPE_BUCKET_TRACE:
                 logger.info(
                     "PREFILL_SHAPE_BUCKET_INDEXER_TIMING op=topk "
